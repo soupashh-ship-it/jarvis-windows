@@ -1,6 +1,6 @@
 # Jarvis for Windows
 
-A voice assistant for your Windows 10/11 PC that talks like J.A.R.V.I.S. from the Iron Man films. Say **"Hey Jarvis"**, wait for the chime, talk. It can open apps, switch windows, look at the screen, click, scroll, type, control media and volume, run PowerShell, write files, and hand longer jobs to background workers.
+A voice assistant for your Windows 10/11 PC that talks like J.A.R.V.I.S. from the Iron Man films. Say **"Hey Jarvis"**, wait for the chime, talk. It can open apps, switch windows, look at the screen, point things out on it, click, scroll, type, control media and volume, run PowerShell, write files, and hand longer jobs to background workers.
 
 It is model agnostic. The brain is any chat model that supports tool calling behind an OpenAI-compatible endpoint: Ollama, LM Studio, OpenAI, OpenRouter, Groq, Gemini, Anthropic and others. By default everything runs locally: wake word (openWakeWord), speech to text (faster-whisper), the model (Ollama) and the voice (Kokoro). Nothing needs the cloud unless you point it there.
 
@@ -13,7 +13,7 @@ How it fits together:
 - `mouth.py`: text to speech (Kokoro by default, a Piper voice, or an OpenAI-compatible speech endpoint), cut off the moment you talk over it.
 - `pctools.py` + `winapi.py`: the tools the model can call. `winapi.py` is the Windows part (windows, mouse, keyboard, hotkeys) through ctypes.
 - `worker.py`: background workers, each its own conversation with the same tools.
-- `jarvis.py`: the main loop. `dashboard.py` + `dashboard.html`: a local web dashboard. `widget.py`: a small always-on-top status panel. `events.py`: the activity log. `jarvisctl.py`: control it from a terminal.
+- `jarvis.py`: the main loop. `dashboard.py` + `dashboard.html`: a local web dashboard. `widget.py`: the status capsule at the bottom of the screen. `overlay.py`: draws rings, arrows and labels on screen for `annotate`. `design.py`: their shared colours and motion. `events.py`: the activity log. `jarvisctl.py`: control it from a terminal, and make a bug report.
 - `persona.md`: the system prompt, a template filled in from your config. `lines.md`: real JARVIS lines by situation, used to tune the voice.
 
 ## Requirements
@@ -41,12 +41,25 @@ powershell -ExecutionPolicy Bypass -File install.ps1
 
 The whisper models download by themselves on the first start, so the first start takes a minute or two.
 
+## Update
+
+No reinstall needed; your `config_local.py`, `notes.md` and logs are kept. In PowerShell, in the repo folder:
+
+```
+git pull
+Stop-ScheduledTask Jarvis; Start-ScheduledTask Jarvis
+```
+
+Only if `git pull` listed `requirements.txt` among the changed files, run `.venv\Scripts\python -m pip install -r requirements.txt` (or `install.ps1` again, which is safe to repeat) before restarting. If `git pull` refuses because you edited `config.py` itself, run `git stash`, `git pull`, then put your settings in `config_local.py` instead (`git stash show -p` shows what you had changed).
+
 ### Microphone
 
 - Settings > Privacy & security > Microphone: turn on **Microphone access** and **Let desktop apps access your microphone**.
 - Settings > System > Sound > Input: pick the mic you want as the default. Jarvis uses the default input unless you set `MIC_DEVICE`.
-- To see every input with its number: `.venv\Scripts\python -m sounddevice`, then set `MIC_DEVICE = 3` (or part of its name) in `config_local.py`.
-- The dashboard's mic meter shows whether it hears you and how close you get to the wake threshold.
+- To pick another mic, set `MIC_DEVICE = "Yeti"` (part of its name) in `config_local.py`. Windows lists each mic several times, once per audio system (MME, DirectSound, WASAPI, WDM-KS); a name picks the MME one. A number picks exactly that entry: every input is listed with its number at the top of `logs\jarvis.log` and by `.venv\Scripts\python -m sounddevice`.
+- `logs\jarvis.log` says which mic it opened (`mic open: ...`), and every time something sounds a bit like "Hey Jarvis" it logs a line such as `wake score 0.31 (threshold 0.50): missed; mic level 12%`. Scores that keep landing just under the threshold mean `WAKE_THRESHOLD` can come down (try 0.3); a low mic level means turning the mic up in Windows' sound settings.
+- If the mic sends nothing but digital silence for 5 seconds (Windows' privacy switch, or a muted mic), Jarvis says so out loud once and logs it.
+- The dashboard's mic meter shows whether it hears you and how close you get to the wake threshold. Win+J is the fallback (if Windows or another app already owns it, the log says so; pick another `HOTKEY_LISTEN`).
 
 ## Choose a model
 
@@ -113,17 +126,19 @@ VOCAB = "Jarvis, Pepper, Manchester, Spotify, Discord, Outlook."
 | `WHISPER_MODEL` / `VOCAB` | Local whisper size, and names it keeps mishearing |
 | `VOICE_ENGINE` | `"kokoro"` (local, default), `"piper"` with `PIPER_MODEL`, or `"openai"` with `TTS_BASE_URL`, `TTS_API_KEY`, `TTS_MODEL` (needs `pcm` output) |
 | `VOICE` / `SPEED` | Kokoro voice (bm_lewis, bm_george, bm_daniel, bm_fable), or the remote service's voice name |
-| `WAKE_THRESHOLD` | Raise if it wakes on its own, lower if it ignores you |
+| `WAKE_THRESHOLD` | Raise if it wakes on its own, lower if it ignores you (the log's `wake score` lines show how close you get) |
 | `END_SILENCE_S` | Raise if it cuts you off mid-sentence |
-| `MIC_DEVICE` | None for the default input |
+| `MIC_DEVICE` | None for the default input, or a number or part of a name (see [Microphone](#microphone)) |
 | `HOTKEY_LISTEN` / `HOTKEY_STOP` | Global hotkeys, default Win+J and Win+Shift+J |
-| `WIDGET_*` | Which monitor and corner the widget sits in |
+| `WIDGET_*` | Which monitor (`"left"`, `"right"` or a name) and where: `bottom-center` (default), `top-center` or a corner |
 
 Restart after changing the config: `Stop-ScheduledTask Jarvis; Start-ScheduledTask Jarvis` in PowerShell.
 
 ## Run and control
 
-It starts at logon by itself. To run it by hand instead (you see its log in the window): `.venv\Scripts\python jarvis.py`. The log is always in `logs\jarvis.log`.
+It starts at logon by itself. To run it by hand instead (you see its log in the window): `.venv\Scripts\python jarvis.py`. The log is always in `logs\jarvis.log` (it rotates at 2 MB, keeping three old ones); when it runs windowless, anything a library prints goes to `logs\console.log`.
+
+The widget is a small capsule at the bottom centre of the screen. Resting, it's a little pill with a dim mic; it springs open when you talk to Jarvis, with one colour per state: a blue mic that pulses with your voice while listening, a white orb while thinking, a purple glow round the edge while he speaks, orange when he's waiting for a yes or no. It settles back a couple of seconds after he finishes. It never takes the mouse or keyboard. (The Linux version blurs what's behind it; Windows can't blur behind a shape, so here it's a translucent dark fill.)
 
 Dashboard: **http://127.0.0.1:8765** (this PC only). It shows what Jarvis is doing, background workers, history with every step and screenshot, what it heard, and has Yes/No buttons and a box for typed commands.
 
@@ -135,10 +150,18 @@ Dashboard: **http://127.0.0.1:8765** (this PC only). It shows what Jarvis is doi
 | Answer a "Shall I...?" | Say yes or no, the dashboard buttons, or `python jarvisctl.py yes` / `no` |
 | Voice test | `python jarvisctl.py speak hello` |
 | Status | `python jarvisctl.py status` |
+| "Where is...?" | Ask "where's the volume mixer?" and it rings, points at and labels it on screen (`annotate`), then clears it |
+| Bug report | Double-click `report.bat`, or `python jarvisctl.py report` (see below) |
 | Fresh session | Say "new session" |
 | Uninstall | `Unregister-ScheduledTask Jarvis`, then delete the folder |
 
 After you answer, it listens for 5 seconds so you can follow up without the wake word. If a hotkey is already taken by Windows or another app, the log says so; pick another in `config_local.py`.
+
+## Bug reports
+
+Double-click **`report.bat`** in the Jarvis folder (or run `.venv\Scripts\python jarvisctl.py report`). It makes `jarvis-report-<date>.zip` on your Desktop and opens Explorer on it; send that file (Discord, a GitHub issue). Nothing is uploaded by itself. It works even when Jarvis isn't running.
+
+Inside: the logs (`jarvis.log` and its old copies, `console.log`, the activity log `events.jsonl`, which includes what Jarvis heard and said), the wake score and microphone lines on their own (`wake-and-mic.txt`), Python and Windows versions, the installed packages, the microphone list, and `config.py` / `config_local.py`. API keys, tokens and passwords are replaced with `<redacted>`: any setting whose name contains KEY, TOKEN, SECRET, PASSWORD or AUTH, plus anything shaped like a key. Screenshots, `notes.md` and the dashboard token are left out. Have a look inside before sending if you're unsure.
 
 ## Sessions and notes
 
@@ -175,18 +198,14 @@ Kokoro works out of the box with British voices (`bm_lewis` is the default). For
 
 ## Known untested
 
-This port was written and checked on Linux: every file compiles, imports cleanly, and `test_brain.py` passes (the agent loop, tool-call streaming, the gate, workers, hotkey parsing and app matching). `requirements.txt` was resolved against Windows / Python 3.12 wheels. **None of it has been run on a real Windows machine yet.** Not verified:
+This port is written and checked on Linux: every file compiles, `test_brain.py` passes (the agent loop, tool-call streaming including a recorded Gemini-style stream, the gate, workers, hotkey parsing, app matching, the bug report's redaction), the widget and the `annotate` overlay were rendered off-screen and look right, and the new microphone code was run against a real mic on Linux. `requirements.txt` was resolved against Windows / Python 3.12 wheels. The first Windows tester has run it; what came back so far:
 
-- `install.ps1` end to end, including the Task Scheduler task (logon start, windowless `pythonw`, restart on failure).
-- Everything in `winapi.py`: SendInput typing and keys, mouse moves and clicks on multi-monitor and high-DPI setups, window listing and the focus-stealing workaround in `focus()` (Windows sometimes refuses to change the foreground window), RegisterHotKey with Win+J.
-- `open_app` / `list_apps` through `Get-StartApps` and `shell:AppsFolder` launching, and matching the new window afterwards.
-- Screenshots with `mss` (coordinates with monitors left of or above the main one, DPI scaling), volume through `pycaw`, media keys, `plyer` notifications.
-- `run_command` through Windows PowerShell 5.1 (UTF-8 output, windowless child processes) and the PowerShell patterns in the safety gate on real-world commands.
-- Audio on Windows: `sounddevice` mic and speaker, wake word, whisper and Kokoro speed on typical hardware.
-- The widget's placement and click-through on Windows.
-- The real providers: only the OpenAI-compatible protocol was tested, against a fake server. Tool calling and image input through Ollama, OpenAI, Anthropic's compatible endpoint, OpenRouter, Groq and Gemini were not exercised. Media "status" (what is playing) is not available on Windows and says so.
+- **Changed after the first Windows report:** "Hey Jarvis" was rarely heard (cause not confirmed yet; the port now logs the mic it opened and every near-miss wake score, warns when the mic is digitally silent, and `MIC_DEVICE` by name no longer crashes on Windows' duplicate device names); background work didn't happen, most likely because of Gemini (its thought signatures were dropped, which Gemini 3 rejects on the request after any tool call, and two tool calls in one Gemini reply were merged into one broken call; the persona now also insists on actually calling `start_worker`); the old corner panel is replaced by the new capsule widget, and `annotate` is ported.
+- **Still not verified on real Windows:** whether those changes actually fix the wake word on the tester's mic; the new widget and the `annotate` overlay on Windows (placement above the taskbar, click-through, high-DPI and multi-monitor: the overlay works in physical pixels, so its labels look smaller on a scaled display; it can't draw over exclusive-fullscreen games); WASAPI devices with automatic conversion; `report.bat` and finding a OneDrive-moved Desktop.
+- **Not verified at all:** `install.ps1` end to end, including the Task Scheduler task (logon start, windowless `pythonw`, restart on failure); everything in `winapi.py` (SendInput typing and keys, mouse moves and clicks on multi-monitor and high-DPI setups, window listing and the focus-stealing workaround in `focus()`, RegisterHotKey with Win+J); `open_app` / `list_apps` through `Get-StartApps` and `shell:AppsFolder`; screenshots with `mss` (monitors left of or above the main one, DPI scaling), volume through `pycaw`, media keys, `plyer` notifications; `run_command` through Windows PowerShell 5.1 and the gate's PowerShell patterns on real-world commands; whisper and Kokoro speed on typical hardware.
+- **Providers:** only the OpenAI-compatible protocol was tested, against a fake server (including Gemini's quirks as documented: no `index` on streamed tool calls, whole calls in one chunk, repeated ids, `extra_content.google.thought_signature`, and no empty-properties schemas). Real tool calling and image input through Ollama, OpenAI, Anthropic's compatible endpoint, OpenRouter, Groq and Gemini were not exercised here. Media "status" (what is playing) is not available on Windows and says so.
 
-Issues and fixes from Windows users are very welcome.
+Issues and fixes from Windows users are very welcome; please attach the `report.bat` zip.
 
 ## Licence
 

@@ -63,9 +63,9 @@ TTS_MODEL = "gpt-4o-mini-tts"
 
 # Desktop widget
 WIDGET_SCREEN = "right"        # monitor by name (e.g. "\\\\.\\DISPLAY2"), or "left"/"right"
-WIDGET_CORNER = "top-right"    # top-right, top-left, bottom-right, bottom-left
+WIDGET_CORNER = "bottom-center"  # bottom-center, top-center, top-right, top-left, bottom-right, bottom-left
 WIDGET_MARGIN_X = 16           # pixels from the side
-WIDGET_MARGIN_Y = 40           # pixels from the top/bottom
+WIDGET_MARGIN_Y = 30           # pixels from the top/bottom (the taskbar is already left out)
 
 # Your own settings go in config_local.py (gitignored), e.g. USER_NAME = "Pepper"
 try:

@@ -8,6 +8,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import threading
 import time
 
@@ -25,10 +26,14 @@ PS_UTF8 = "[Console]::OutputEncoding = [Text.Encoding]::UTF8; "
 
 
 def tool(name, description, params):
-    """Register an async tool; params maps argument names to Python types (all required)."""
+    """Register an async tool; params maps argument names to Python types (all required), or is a full JSON schema."""
+    if params.get("type") != "object":
+        params = {"type": "object", "properties": {k: {"type": TYPES[t]} for k, t in params.items()}, "required": list(params)}
+    if not params["properties"]:     # Gemini rejects an object with no properties, so no-argument tools get an optional one
+        params = {"type": "object", "properties": {"note": {"type": "string", "description": "optional, ignored"}}}
+
     def register(fn):
-        fn.spec = {"type": "function", "function": {"name": name, "description": description, "parameters": {
-            "type": "object", "properties": {k: {"type": TYPES[t]} for k, t in params.items()}, "required": list(params)}}}
+        fn.spec = {"type": "function", "function": {"name": name, "description": description, "parameters": params}}
         TOOLS[name] = fn
         return fn
     return register
@@ -84,6 +89,7 @@ def window_names(app):
 @tool("open_app", "Open an application by name and bring it to the front, e.g. 'spotify', 'discord', "
       "'obs', 'steam', 'files'. If it is already running, its window is focused instead.", {"name": str})
 async def open_app(args):
+    await asyncio.to_thread(start_apps)      # PowerShell takes seconds; off the event loop so Jarvis keeps listening
     app = find_app(args["name"])
     for q in [args["name"]] + (window_names(app) if app else []):
         w = winapi.focus(q)
@@ -104,7 +110,8 @@ async def open_app(args):
 @tool("list_apps", "List installed apps whose name contains the query (empty query = all).", {"query": str})
 async def list_apps(args):
     q = args.get("query", "").lower()
-    return text(", ".join(sorted(a["name"] for a in start_apps() if q in a["name"].lower())) or "none")
+    apps = await asyncio.to_thread(start_apps)
+    return text(", ".join(sorted(a["name"] for a in apps if q in a["name"].lower())) or "none")
 
 
 @tool("open_path", "Open a file, folder or URL with its default app.", {"target": str})
@@ -265,6 +272,72 @@ async def notify(args):
     threading.Thread(target=notification.notify, daemon=True, kwargs={
         "title": args["title"][:63], "message": args["body"][:255], "app_name": "Jarvis", "timeout": 10}).start()
     return text("Shown.")
+
+
+# ---------- show me where ----------
+
+OVERLAY = {"proc": None}
+OVERLAY_LOG = os.path.join(config.JARVIS_DIR, "logs", "overlay.log")
+SHAPE = {"type": "object", "required": ["type", "x", "y"], "properties": {
+    "type": {"type": "string", "enum": ["ring", "arrow", "rect"]},
+    "x": {"type": "number"}, "y": {"type": "number"}, "radius": {"type": "number"},
+    "from_x": {"type": "number"}, "from_y": {"type": "number"}, "w": {"type": "number"}, "h": {"type": "number"},
+    "label": {"type": "string"}, "step": {"type": "integer"}}}
+
+
+def shapes_to_desktop(shapes):
+    """Screenshot-image coordinates -> desktop pixels, the same mapping click_at uses; sizes scale with it."""
+    out = []
+    for s in shapes:
+        s = dict(s)
+        for kx, ky in (("x", "y"), ("from_x", "from_y")):
+            if kx in s and ky in s:
+                s[kx], s[ky] = to_desktop(float(s[kx]), float(s[ky]))
+        for k in ("radius", "w", "h"):
+            if k in s:
+                s[k] = float(s[k]) * LAST_SHOT["scale"]
+        out.append(s)
+    return out
+
+
+def stop_overlay():
+    if OVERLAY["proc"] and OVERLAY["proc"].poll() is None:
+        OVERLAY["proc"].terminate()
+
+
+@tool("annotate", "Draw on the user's screen to SHOW them where something is (blue rings, arrows, boxes and labels; "
+      "click-through, clears itself). Coordinates are pixels in the most recent screenshot image, exactly like "
+      "click_at. Each shape: type 'ring' (x, y = centre, radius), 'arrow' (from_x, from_y -> x, y; the head is at x, y, "
+      "the target) or 'rect' (x, y = top-left, w, h); optional label (2-4 words; add '\\n' and a short detail line if "
+      "useful) and step (1, 2, 3 for a sequence). duration: seconds before it clears, default 8. A new annotate "
+      "replaces the old drawing.",
+      {"type": "object", "required": ["shapes"], "properties": {
+          "shapes": {"type": "array", "items": SHAPE}, "duration": {"type": "number"}}})
+async def annotate(args):
+    shapes = args.get("shapes") or []
+    if not shapes:
+        return text("Nothing to draw.")
+    try:
+        desktop = shapes_to_desktop(shapes)
+    except (KeyError, TypeError, ValueError) as e:
+        return text(f"Bad shape: {e}.")
+    duration = max(1.0, min(120.0, float(args.get("duration") or 8)))
+    stop_overlay()
+    with open(OVERLAY_LOG, "w") as log:
+        OVERLAY["proc"] = subprocess.Popen([sys.executable, os.path.join(config.JARVIS_DIR, "overlay.py"),
+                                            json.dumps({"shapes": desktop, "duration": duration})],
+                                           stdout=log, stderr=log, creationflags=NO_WINDOW)
+    await asyncio.sleep(0.6)                 # a bad shape or a broken Qt shows up as an instant exit
+    if OVERLAY["proc"].poll() not in (None, 0):
+        with open(OVERLAY_LOG) as f:
+            return text("The overlay failed: " + f.read()[-400:])
+    return text(f"Drawing {len(shapes)} shape(s) on screen for {duration:g}s.")
+
+
+@tool("clear_annotations", "Remove whatever annotate drew on the screen, right now.", {})
+async def clear_annotations(args):
+    stop_overlay()
+    return text("Cleared.")
 
 
 # ---------- commands and files ----------

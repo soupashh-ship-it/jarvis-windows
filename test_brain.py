@@ -1,7 +1,9 @@
 """Run: .venv\\Scripts\\python test_brain.py   (no model, microphone or Windows needed)
 
 Checks the agent loop against a fake OpenAI-compatible server (streamed text, a tool call split across chunks,
-a gated call the user refuses), the safety rules, worker permission routing, hotkey parsing and app matching.
+a gated call the user refuses, and a Gemini-style stream: no index, repeated ids, parallel calls in one chunk, a
+thought signature that must come back, an empty reply), the safety rules, worker permission routing, hotkey parsing,
+app matching and the report's redaction.
 """
 import asyncio
 import json
@@ -34,6 +36,15 @@ REPLIES = [   # what the fake model says, request by request
     sse(call(0, "c2", "run_command", '{"command": "Remove-Item C:\\\\x", "description": "Delete x", "timeout": 5}')),
     sse({"content": "All done, sir."}),
 ]
+GEMINI = [    # recorded shape of Gemini's OpenAI-compatible stream: whole calls in one chunk, no index, id "0" twice
+    sse({"role": "assistant", "tool_calls": [
+        {"id": "0", "type": "function", "extra_content": {"google": {"thought_signature": "sigA"}},
+         "function": {"name": "run_command", "arguments": '{"command": "echo a", "description": "a", "timeout": 5}'}},
+        {"id": "0", "type": "function",
+         "function": {"name": "run_command", "arguments": '{"command": "echo b", "description": "b", "timeout": 5}'}}]}),
+    sse({"content": ""}),
+    sse({"content": "Both done."}),
+]
 seen = []
 
 
@@ -60,7 +71,24 @@ async def main():
     b.agent = brain.Agent("test persona", b.gate, list(pctools.TOOLS.values()), on_text=b._text)
     b.session_id = "test"
     await b.ask("[Mon 28 Sep, 07:42] say hi")
+    first = list(seen)
+
+    global REPLIES
+    REPLIES = GEMINI
+    seen.clear()
+    g = brain.Agent("test persona", b.gate, list(pctools.TOOLS.values()))
+    assert await g.run("run a and b") == ""                         # Gemini sometimes answers with nothing
+    assert await g.run("and?") == "Both done."
     await runner.cleanup()
+    calls = seen[1]["messages"][2]["tool_calls"]
+    assert [json.loads(c["function"]["arguments"])["command"] for c in calls] == ["echo a", "echo b"], calls
+    assert calls[0]["extra_content"] == {"google": {"thought_signature": "sigA"}} and "extra_content" not in calls[1]
+    assert len({c["id"] for c in calls}) == 2, calls                 # each call gets its own id...
+    assert [m["tool_call_id"] for m in seen[1]["messages"] if m["role"] == "tool"] == [c["id"] for c in calls]
+    assert [m["content"] for m in seen[1]["messages"] if m["role"] == "tool"] == ["a", "b"]
+    assert not [m for m in seen[2]["messages"] if m["role"] == "assistant" and not m.get("content")
+                and not m.get("tool_calls")]                         # ...and the empty reply is never sent back
+    seen[:] = first
 
     assert spoken == ["Checking now.", "All done, sir."], spoken
     assert asked == ["Shall I delete x?"], asked                     # echo ran unasked, Remove-Item was put to the user
@@ -103,6 +131,15 @@ assert asyncio.run(w.permit("run_command", {"command": "del x", "description": "
 assert asked == ["Sir, the report worker would like to delete x. Shall I allow it?"] and w.state == "running"
 assert [worker.outcome(r, f) for r, f in (("Saved to notes.md", False), ("NEED USER: 2x or 4x?", False), ("", True))] \
     == ["done", "waiting", "failed"]
+
+# Gemini rejects tools whose parameters have no properties
+assert all(t.spec["function"]["parameters"]["properties"] for t in pctools.TOOLS.values())
+
+# the bug report keeps settings but drops secrets
+import jarvisctl  # noqa: E402
+r = jarvisctl.redact('LLM_API_KEY = "AIzaSyD-abcdefghijklmnopqrstu"\nLLM_MODEL = "gemini-3-flash"\n'
+                     'x Authorization: Bearer abcdef123456789 y\nkey sk-or-v1-abcdef0123456789 and gsk_abcdef0123456789')
+assert "abcdef" not in r and "AIza" not in r and 'LLM_MODEL = "gemini-3-flash"' in r, r
 
 # hotkeys, app matching, reasoning text never spoken
 assert winapi.parse_hotkey("win+shift+j") == (8 | 4, ord("J")) and winapi.parse_hotkey("ctrl+alt+f12") == (3, 0x7B)

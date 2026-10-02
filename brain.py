@@ -29,6 +29,10 @@ def persona():
 
 # ---------- the model ----------
 
+def ids_of(calls):
+    return [c["id"] for c in calls]
+
+
 async def chat(messages, tools=None, on_text=None, model=None):
     """One streamed chat completion. Returns the assistant message: its text plus any tool calls."""
     body = {"model": model or config.LLM_MODEL, "messages": messages, "stream": True}
@@ -54,16 +58,21 @@ async def chat(messages, tools=None, on_text=None, model=None):
                 if on_text:
                     on_text(delta["content"])
             for tc in delta.get("tool_calls") or []:
-                i = tc.get("index")
-                if i is None:                       # some servers leave the index out: go by id instead
-                    ids = [c["id"] for c in calls]
-                    i = ids.index(tc["id"]) if tc.get("id") in ids else len(calls) if tc.get("id") or not calls else len(calls) - 1
+                f, i = tc.get("function") or {}, tc.get("index")
+                if i is None:   # Gemini leaves the index out (and may repeat or blank the id): a name starts a new call
+                    ids = ids_of(calls)
+                    i = (len(calls) if f.get("name") or not calls else ids.index(tc["id"]) if tc.get("id") in ids
+                         else len(calls) if tc.get("id") else len(calls) - 1)
                 while len(calls) <= i:
                     calls.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
-                c, f = calls[i], tc.get("function") or {}
-                c["id"] = c["id"] or tc.get("id") or "call_" + uuid.uuid4().hex[:12]
+                c = calls[i]
+                if not c["id"]:                     # every call needs its own id for its tool message
+                    c["id"] = tc["id"] if tc.get("id") and tc["id"] not in ids_of(calls) else "call_" + uuid.uuid4().hex[:12]
                 c["function"]["name"] = c["function"]["name"] or f.get("name") or ""
                 c["function"]["arguments"] += f.get("arguments") or ""
+                # anything else rides along unchanged: Gemini 3 rejects the next request unless its
+                # extra_content.google.thought_signature comes back on the call
+                c.update({k: v for k, v in tc.items() if k not in ("index", "id", "type", "function")})
     msg = {"role": "assistant", "content": said or (None if calls else "")}
     if calls:
         msg["tool_calls"] = calls
@@ -93,11 +102,13 @@ class Agent:
             self.trim()
             msg = await chat([{"role": "system", "content": self.system}] + self.messages,
                              [f.spec for f in self.tools.values()], self.on_text, self.model)
-            self.messages.append(msg)
             if self.on_text:
                 self.on_text("\n")                  # end of a message: speak whatever is left
             if not msg.get("tool_calls"):
+                if msg["content"]:                  # an empty reply isn't kept: Gemini rejects empty messages
+                    self.messages.append(msg)
                 return msg["content"] or ""
+            self.messages.append(msg)
             images, answered = [], set()
             try:
                 for call in msg["tool_calls"]:

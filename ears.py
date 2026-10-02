@@ -24,6 +24,25 @@ FRAME_S = FRAME / RATE
 
 # Whisper invents these on silence or noise
 JUNK = re.compile(r"^\W*(thank you|thanks for watching|you|bye|\.+|okay)?\W*$", re.I)
+NEAR_MISS = 0.05        # wake scores above this get logged, so a tester can see how close "hey jarvis" came
+
+
+def describe(i):
+    d = sd.query_devices(i)
+    return f"[{i}] {d['name']} ({sd.query_hostapis(d['hostapi'])['name']}, {d['default_samplerate']:.0f} Hz, " \
+           f"{d['max_input_channels']} ch)"
+
+
+def pick_mic(want):
+    """MIC_DEVICE -> a device number. On Windows each mic is listed once per audio API (MME, DirectSound, WASAPI,
+    WDM-KS), so a name matches several; prefer MME, which records at 16 kHz and lets Windows do the resampling."""
+    if want is None or isinstance(want, int):
+        return want
+    found = [i for i, d in enumerate(sd.query_devices())
+             if d["max_input_channels"] > 0 and str(want).lower() in d["name"].lower()]
+    if not found:
+        raise ValueError(f"no microphone matches MIC_DEVICE = {want!r} (the inputs are listed in logs/jarvis.log)")
+    return min(found, key=lambda i: "MME" not in sd.query_hostapis(sd.query_devices(i)["hostapi"])["name"])
 
 
 class Recorder:
@@ -71,27 +90,48 @@ class Ears:
         if config.STT_ENGINE == "whisper":
             self.whisper = WhisperModel(config.WHISPER_MODEL, device="cpu", compute_type="int8")
             self.fast = WhisperModel("base.en", device="cpu", compute_type="int8")   # rough live text while you talk
+        self.peak = self.peak_level = 0.0
+        self.dropped = 0                 # audio blocks lost (the mic overflowed, or Jarvis fell behind)
+        log.info("microphones: %s", "; ".join(describe(i) for i, d in enumerate(sd.query_devices())
+                                              if d["max_input_channels"] > 0))
+        self.device = pick_mic(config.MIC_DEVICE)
+        info = sd.query_devices(self.device, kind="input")
+        api = sd.query_hostapis(info["hostapi"])["name"]
+        self.mic_name = f"{info['name']} ({api})"
+        # WASAPI refuses 16 kHz unless Windows is allowed to convert; MME and DirectSound convert anyway.
+        extra = sd.WasapiSettings(auto_convert=True) if "WASAPI" in api else None
         self.stream = sd.InputStream(samplerate=RATE, channels=1, dtype="int16", blocksize=FRAME,
-                                     device=config.MIC_DEVICE, callback=self._callback)
+                                     device=self.device, extra_settings=extra, callback=self._callback)
 
     def start(self):
         self.stream.start()
-        self.mic_name = sd.query_devices(config.MIC_DEVICE, kind="input")["name"]
-        log.info("mic open: %s", self.mic_name)
+        log.info("mic open: %s, native %.0f Hz, recording %d Hz mono; wake threshold %.2f",
+                 describe(self.stream.device), sd.query_devices(self.stream.device)["default_samplerate"], RATE,
+                 config.WAKE_THRESHOLD)
 
     def _callback(self, indata, frames, t, status):
+        if status.input_overflow:
+            self.dropped += 1
         self.loop.call_soon_threadsafe(self._put, indata[:, 0].copy())
 
     def _put(self, chunk):
         if self.q.full():
             self.q.get_nowait()
+            self.dropped += 1
         self.q.put_nowait(chunk)
 
     def heard_wake_word(self, chunk):
         score = max(self.oww.predict(chunk).values())
         self.last_score = score
+        if score >= NEAR_MISS:           # one log line per attempt: its best score and how loud the mic was
+            self.peak = max(self.peak, score)
+            self.peak_level = max(self.peak_level, float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2))) / 32768)
+        if score >= config.WAKE_THRESHOLD or (self.peak and score < NEAR_MISS):
+            log.info("wake score %.2f (threshold %.2f): %s; mic level %d%%, %d audio blocks dropped so far",
+                     self.peak, config.WAKE_THRESHOLD, "woke" if score >= config.WAKE_THRESHOLD else "missed",
+                     min(100, self.peak_level * 800), self.dropped)
+            self.peak = self.peak_level = 0.0
         if score >= config.WAKE_THRESHOLD:
-            log.info("wake word (%.2f)", score)
             self.reset_wake()
             return True
         return False

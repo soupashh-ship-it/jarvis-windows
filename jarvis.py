@@ -8,6 +8,7 @@ import asyncio
 import collections
 import json
 import logging
+import logging.handlers
 import os
 import re
 import signal
@@ -15,7 +16,14 @@ import sys
 import time
 from datetime import datetime, timedelta
 
-import numpy as np
+CONSOLE = sys.stderr is not None
+if not CONSOLE:   # pythonw (the logon task) has no console: keep library output and stray tracebacks in a file
+    _console = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "console.log")
+    os.makedirs(os.path.dirname(_console), exist_ok=True)
+    _mode = "a" if os.path.exists(_console) and os.path.getsize(_console) < 5e6 else "w"
+    sys.stdout = sys.stderr = open(_console, _mode, encoding="utf-8", buffering=1)
+
+import numpy as np  # noqa: E402
 
 import config
 import dashboard
@@ -50,7 +58,8 @@ log = logging.getLogger("jarvis")
 STEP_WORDS = {"screenshot": "Looking at the screen", "click_at": "Clicking", "move_mouse": "Moving the mouse",
               "scroll": "Scrolling", "type_text": "Typing", "press_keys": "Pressing keys", "open_app": "Opening an app",
               "focus_window": "Switching windows", "list_windows": "Checking windows", "media": "Media controls",
-              "volume": "Volume", "run_command": "Command", "write_file": "Writing", "start_worker": "Starting a worker"}
+              "volume": "Volume", "run_command": "Command", "write_file": "Writing", "start_worker": "Starting a worker",
+              "annotate": "Pointing on screen"}
 
 
 def step_words(ev):
@@ -64,7 +73,7 @@ def step_words(ev):
     detail = inp.get("description") or inp.get("query") or inp.get("url") or inp.get("name") or ""
     if short == "write_file" and inp.get("path"):
         detail = os.path.basename(inp["path"])
-    if short in ("screenshot", "click_at", "move_mouse", "scroll"):
+    if short in ("screenshot", "click_at", "move_mouse", "scroll", "annotate"):
         detail = ""
     return f"{name}: {detail}" if detail else name
 
@@ -86,6 +95,8 @@ class Jarvis:
         self.started = time.time()
         self.level = 0.0
         self.wake_score = 0.0
+        self.zero_blocks = 0              # audio that is exactly silent: a blocked or muted mic, not a quiet room
+        self.told_mic_silent = False
         self.brain_lock = asyncio.Lock()   # held while asking, and while swapping sessions
         self.confirm_lock = asyncio.Lock()     # one spoken yes/no at a time (Jarvis and workers share it)
         worker.confirm = self.confirm
@@ -191,6 +202,9 @@ class Jarvis:
         while True:
             chunk = await self.ears.q.get()
             self.level = max(self.level * 0.6, float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2))) / 32768)
+            self.zero_blocks = 0 if chunk.any() else self.zero_blocks + 1
+            if self.zero_blocks == 63:                 # 5 s of digital silence
+                self.mic_silent()
             if self.state != LISTEN:
                 if self.ears.heard_wake_word(chunk):
                     await self.wake()
@@ -218,6 +232,16 @@ class Jarvis:
                 continue
             self.state = BUSY
             self.loop.create_task(self.handle_audio(result, target))
+
+    def mic_silent(self):
+        msg = (f"The microphone ({self.ears.mic_name}) is sending pure silence: Windows is blocking it or it is muted. "
+               "Check Settings > Privacy & security > Microphone (both switches on) and the mic's mute.")
+        log.warning(msg)
+        events.emit("error", where="mic", error=msg)
+        if not self.told_mic_silent:
+            self.told_mic_silent = True
+            self.mouth.say(f"My microphone is giving me pure silence, {config.HONORIFIC}. "
+                           "Windows may be blocking it; the log has the details.")
 
     async def live_partial(self, listen_id, frames):
         self.partial_busy = True
@@ -439,7 +463,8 @@ class Jarvis:
 
 async def main():
     os.makedirs(os.path.dirname(config.LOG_FILE), exist_ok=True)
-    handlers = [logging.FileHandler(config.LOG_FILE, encoding="utf-8")] + ([logging.StreamHandler()] if sys.stderr else [])
+    handlers = [logging.handlers.RotatingFileHandler(config.LOG_FILE, maxBytes=2_000_000, backupCount=3, encoding="utf-8")]
+    handlers += [logging.StreamHandler()] if CONSOLE else []
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s: %(message)s", handlers=handlers)
     jarvis = Jarvis()
     loop, stop = asyncio.get_running_loop(), asyncio.Event()
