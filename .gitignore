@@ -5,4 +5,7 @@ models/
 state.json
 notes.md
 config_local.py
+.env
+.env.*
+!.env.example
 *.bak*

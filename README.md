@@ -2,9 +2,9 @@
 
 A voice assistant for your Windows 10/11 PC that talks like J.A.R.V.I.S. from the Iron Man films. Say **"Hey Jarvis"**, wait for the chime, talk. It can open apps, switch windows, look at the screen, point things out on it, click, scroll, type, control media and volume, run PowerShell, write files, and hand longer jobs to background workers.
 
-It is model agnostic. The brain is any chat model that supports tool calling behind an OpenAI-compatible endpoint: Ollama, LM Studio, OpenAI, OpenRouter, Groq, Gemini, Anthropic and others. By default everything runs locally: wake word (openWakeWord), speech to text (faster-whisper), the model (Ollama) and the voice (Kokoro). Nothing needs the cloud unless you point it there.
+The default brain uses Gemini 3.8 Flash Medium through Google's official Antigravity CLI and the Google account you sign in with; no API key is needed. Wake word, speech recognition and speech output run locally. You can switch the brain to Ollama, LM Studio, OpenAI-compatible services, or other providers in `config_local.py`.
 
-This is a Windows port of a Linux (KDE Plasma) Jarvis. The Linux original drives Claude Code; this one has its own small agent loop instead, so no Claude Code or any other CLI is needed.
+This is a Windows port of a Linux (KDE Plasma) Jarvis. The Windows app has its own small agent loop; the official Antigravity CLI is used only for its signed-in model session and is installed by setup.
 
 How it fits together:
 
@@ -20,30 +20,36 @@ How it fits together:
 
 - Windows 10 or 11, 64-bit.
 - **Python 3.12** from python.org (keep the "py launcher" option ticked). Other versions may work; 3.12 is what the pinned packages are chosen for.
-- A model to talk to (see [Choose a model](#choose-a-model)). For the fully local default, install [Ollama](https://ollama.com) and run `ollama pull qwen3-vl:8b` (needs a decent GPU, or patience).
+- A Google account with access to the Gemini model through Antigravity. The setup opens Google's CLI so you can sign in once; Jarvis does not ask for an API key.
+- Optional: [Ollama](https://ollama.com) and a local model if you prefer not to use Antigravity.
 - A microphone. Headphones are recommended if you want to interrupt it by talking over it.
 - About 2 GB of disk for the voice, wake word and whisper models.
 
 ## Install
 
+1. Install **Python 3.12** from python.org and keep the **py launcher** option checked.
+2. [Download the ZIP](https://github.com/soupashh-ship-it/jarvis-windows/archive/refs/heads/main.zip) and extract it to a permanent folder. The scheduled task will use this folder, so do not move it after setup.
+3. Open PowerShell in the extracted folder and run:
+
 ```
-git clone https://github.com/NickBhai-GH/jarvis-windows.git
-cd jarvis-windows
-powershell -ExecutionPolicy Bypass -File install.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-`install.ps1` does four things, and is safe to run again:
+`install.ps1` installs the official Antigravity CLI if needed, prepares Jarvis, and starts it:
 
 1. creates `.venv` with Python 3.12 and installs `requirements.txt`,
-2. downloads the Kokoro voice into `models\` and the "Hey Jarvis" wake word model,
-3. registers a Task Scheduler task called **Jarvis** for your user (no admin needed) that starts Jarvis and its widget at every logon, windowless, and restarts them if they crash,
-4. starts it.
+2. downloads the Kokoro voice and the "Hey Jarvis" wake word model,
+3. opens the official Antigravity CLI. Sign in with the Google account that has access to the Gemini model, then type `/exit` or press **Ctrl+D** to return to setup,
+4. registers a Task Scheduler task called **Jarvis** for your user (no admin needed) that starts Jarvis and its widget at every logon and restarts them if they crash,
+5. starts Jarvis.
 
-The whisper models download by themselves on the first start, so the first start takes a minute or two.
+The CLI stores its sign-in in your Windows credential store. The whisper models download on first start, so setup can take a few minutes.
 
 ## Update
 
-No reinstall needed; your `config_local.py`, `notes.md` and logs are kept. In PowerShell, in the repo folder:
+If you downloaded a ZIP, stop Jarvis, extract the newer ZIP over the existing folder, then run `install.ps1` again. Your `config_local.py`, `notes.md`, logs and downloaded voice models are local files ignored by GitHub's ZIP and will be kept.
+
+If you cloned the repo with Git, in PowerShell in the repo folder:
 
 ```
 git pull
@@ -57,20 +63,32 @@ Only if `git pull` listed `requirements.txt` among the changed files, run `.venv
 - Settings > Privacy & security > Microphone: turn on **Microphone access** and **Let desktop apps access your microphone**.
 - Settings > System > Sound > Input: pick the mic you want as the default. Jarvis uses the default input unless you set `MIC_DEVICE`.
 - To pick another mic, set `MIC_DEVICE = "Yeti"` (part of its name) in `config_local.py`. Windows lists each mic several times, once per audio system (MME, DirectSound, WASAPI, WDM-KS); a name picks the MME one. A number picks exactly that entry: every input is listed with its number at the top of `logs\jarvis.log` and by `.venv\Scripts\python -m sounddevice`.
-- `logs\jarvis.log` says which mic it opened (`mic open: ...`), and every time something sounds a bit like "Hey Jarvis" it logs a line such as `wake score 0.31 (threshold 0.50): missed; mic level 12%`. Scores that keep landing just under the threshold mean `WAKE_THRESHOLD` can come down (try 0.3); a low mic level means turning the mic up in Windows' sound settings.
+- `logs\jarvis.log` says which mic it opened (`mic open: ...`) and records the peak wake score and signal level for each spoken attempt, including attempts interrupted by the manual trigger. Wake scores are accepted only when recent audio is present, which filters model spikes on digital silence.
 - If the mic sends nothing but digital silence for 5 seconds (Windows' privacy switch, or a muted mic), Jarvis says so out loud once and logs it.
 - The dashboard's mic meter shows whether it hears you and how close you get to the wake threshold. Win+J is the fallback (if Windows or another app already owns it, the log says so; pick another `HOTKEY_LISTEN`).
 
 ## Choose a model
 
-Put your settings in `config_local.py` in the repo folder (gitignored; it overrides `config.py`). The model needs **tool calling**; for screenshots it also needs **vision** (otherwise set `LLM_VISION = False`). The API key can also come from the `JARVIS_LLM_API_KEY` environment variable instead of the file.
+The default settings are already configured for the official Antigravity CLI and do not require `config_local.py`. The model runs through the account you signed in with; Jarvis does not read, store, or need a Gemini API key.
 
-Ollama, local (the default, no key):
+To change settings, create `config_local.py` in the repo folder (it is gitignored and overrides `config.py`). Models used through an OpenAI-compatible endpoint need **tool calling**; for screenshots they also need **vision** (otherwise set `LLM_VISION = False`). In that mode, the API key can come from the `JARVIS_LLM_API_KEY` environment variable instead of the file.
+
+Ollama, local (no API key):
 
 ```
 LLM_BASE_URL = "http://localhost:11434/v1"
 LLM_MODEL = "qwen3-vl:8b"          # any Ollama model tagged "tools" (and "vision" for screenshots)
 ```
+
+Antigravity subscription, through Google's official signed-in CLI (no API key):
+
+```
+LLM_PROVIDER = "antigravity"
+LLM_MODEL = "gemini-3.8-flash-medium"  # Fast reply tier; use `agy models` for available model IDs
+# WORKER_MODEL = "<model from agy models>"  # optional; blank uses the same model
+```
+
+The installer installs the [official Antigravity CLI](https://www.antigravity.google/docs/cli/install/) and opens its sign-in flow. Available models depend on the account; check `agy models`. Jarvis keeps its headless CLI session warm while running; screenshots are passed through its read-only image viewer. See the [headless CLI guide](https://www.antigravity.google/docs/cli/headless/) and [model list](https://www.antigravity.google/docs/models/).
 
 OpenAI:
 
@@ -105,7 +123,7 @@ Others work the same way:
 | Google Gemini | `https://generativelanguage.googleapis.com/v1beta/openai/` |
 | Anything else that speaks OpenAI chat completions with `tools` | its `/v1` URL |
 
-`WORKER_MODEL` lets background workers use a different (say cheaper) model on the same endpoint.
+`WORKER_MODEL` lets background workers use a different model. With Antigravity, choose a model ID shown by `agy models`; blank uses the same model as Jarvis.
 
 ## Configure the rest
 
@@ -127,6 +145,8 @@ VOCAB = "Jarvis, Pepper, Manchester, Spotify, Discord, Outlook."
 | `VOICE_ENGINE` | `"kokoro"` (local, default), `"piper"` with `PIPER_MODEL`, or `"openai"` with `TTS_BASE_URL`, `TTS_API_KEY`, `TTS_MODEL` (needs `pcm` output) |
 | `VOICE` / `SPEED` | Kokoro voice (bm_lewis, bm_george, bm_daniel, bm_fable), or the remote service's voice name |
 | `WAKE_THRESHOLD` | Raise if it wakes on its own, lower if it ignores you (the log's `wake score` lines show how close you get) |
+| `WAKE_MIN_RMS` | Minimum recent mic level needed to accept a wake score (lower for a very quiet mic; default `80`) |
+| `WAKE_VAD_THRESHOLD` | Speech-activity cutoff applied to wake scores; lower if quiet speech is filtered |
 | `END_SILENCE_S` | Raise if it cuts you off mid-sentence |
 | `MIC_DEVICE` | None for the default input, or a number or part of a name (see [Microphone](#microphone)) |
 | `HOTKEY_LISTEN` / `HOTKEY_STOP` | Global hotkeys, default Win+J and Win+Shift+J |
@@ -196,14 +216,13 @@ Kokoro works out of the box with British voices (`bm_lewis` is the default). For
 
 `test_brain.py` and `test_time_tag.py` need no model, microphone or Windows.
 
-## Known untested
+## Known limits and verification
 
-This port is written and checked on Linux: every file compiles, `test_brain.py` passes (the agent loop, tool-call streaming including a recorded Gemini-style stream, the gate, workers, hotkey parsing, app matching, the bug report's redaction), the widget and the `annotate` overlay were rendered off-screen and look right, and the new microphone code was run against a real mic on Linux. `requirements.txt` was resolved against Windows / Python 3.12 wheels. The first Windows tester has run it; what came back so far:
+Jarvis has been run on Windows with Python 3.12 and the official Antigravity CLI. The local voice pipeline and Gemini subscription connection have both been used on one Windows machine. A clean install from the GitHub ZIP has not yet been independently verified on another PC, and display scaling, microphones and available models vary by setup.
 
-- **Changed after the first Windows report:** "Hey Jarvis" was rarely heard (cause not confirmed yet; the port now logs the mic it opened and every near-miss wake score, warns when the mic is digitally silent, and `MIC_DEVICE` by name no longer crashes on Windows' duplicate device names); background work didn't happen, most likely because of Gemini (its thought signatures were dropped, which Gemini 3 rejects on the request after any tool call, and two tool calls in one Gemini reply were merged into one broken call; the persona now also insists on actually calling `start_worker`); the old corner panel is replaced by the new capsule widget, and `annotate` is ported.
-- **Still not verified on real Windows:** whether those changes actually fix the wake word on the tester's mic; the new widget and the `annotate` overlay on Windows (placement above the taskbar, click-through, high-DPI and multi-monitor: the overlay works in physical pixels, so its labels look smaller on a scaled display; it can't draw over exclusive-fullscreen games); WASAPI devices with automatic conversion; `report.bat` and finding a OneDrive-moved Desktop.
-- **Not verified at all:** `install.ps1` end to end, including the Task Scheduler task (logon start, windowless `pythonw`, restart on failure); everything in `winapi.py` (SendInput typing and keys, mouse moves and clicks on multi-monitor and high-DPI setups, window listing and the focus-stealing workaround in `focus()`, RegisterHotKey with Win+J); `open_app` / `list_apps` through `Get-StartApps` and `shell:AppsFolder`; screenshots with `mss` (monitors left of or above the main one, DPI scaling), volume through `pycaw`, media keys, `plyer` notifications; `run_command` through Windows PowerShell 5.1 and the gate's PowerShell patterns on real-world commands; whisper and Kokoro speed on typical hardware.
-- **Providers:** only the OpenAI-compatible protocol was tested, against a fake server (including Gemini's quirks as documented: no `index` on streamed tool calls, whole calls in one chunk, repeated ids, `extra_content.google.thought_signature`, and no empty-properties schemas). Real tool calling and image input through Ollama, OpenAI, Anthropic's compatible endpoint, OpenRouter, Groq and Gemini were not exercised here. Media "status" (what is playing) is not available on Windows and says so.
+- The wake word and Gemini model have worked on the maintainer's PC, but normal-speed speech recognition can still depend on the microphone and room noise. Use Win+J if needed and check `logs\jarvis.log` for microphone diagnostics.
+- The setup script, Task Scheduler restart-on-failure behavior, high-DPI/multi-monitor pointer tools, exclusive-fullscreen overlays, and `report.bat` have not been verified across a range of Windows PCs.
+- Other model providers may differ in tool calling and image support. Media "status" (what is playing) is not available on Windows and reports that limitation.
 
 Issues and fixes from Windows users are very welcome; please attach the `report.bat` zip.
 

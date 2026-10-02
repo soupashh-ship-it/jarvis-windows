@@ -4,7 +4,21 @@
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
-# 1. Python 3.12 virtual environment and packages
+# 1. Install the official Antigravity CLI if needed. Google stores its sign-in in the user's credential store.
+$agyDir = Join-Path $env:LOCALAPPDATA "agy\bin"
+$agyPath = Join-Path $agyDir "agy.exe"
+if (-not (Test-Path $agyPath)) {
+    $agyCommand = Get-Command agy.exe -ErrorAction SilentlyContinue
+    if ($agyCommand) { $agyPath = $agyCommand.Source }
+}
+if (-not (Test-Path $agyPath)) {
+    Write-Host "Installing the official Google Antigravity CLI..."
+    Invoke-Expression (Invoke-RestMethod "https://antigravity.google/cli/install.ps1")
+    $agyPath = Join-Path $env:LOCALAPPDATA "agy\bin\agy.exe"
+}
+if (-not (Test-Path $agyPath)) { throw "Antigravity CLI wasn't installed. See https://antigravity.google/docs/cli/install/." }
+
+# 2. Python 3.12 virtual environment and packages
 if (-not (Get-Command py -ErrorAction SilentlyContinue)) {
     throw "The py launcher wasn't found. Install Python 3.12 from python.org first (keep 'py launcher' ticked)."
 }
@@ -13,7 +27,7 @@ if (-not (Test-Path .venv)) { py -3.12 -m venv .venv; if ($LASTEXITCODE) { throw
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 if ($LASTEXITCODE) { throw "pip install failed, see above." }
 
-# 2. Kokoro voice, "Hey Jarvis" wake word and voice detection models (whisper downloads itself on first run)
+# 3. Kokoro voice, "Hey Jarvis" wake word and voice detection models (whisper downloads itself on first run)
 New-Item -ItemType Directory -Force models, logs | Out-Null
 $kokoro = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0"
 foreach ($f in "kokoro-v1.0.onnx", "voices-v1.0.bin") {
@@ -22,7 +36,14 @@ foreach ($f in "kokoro-v1.0.onnx", "voices-v1.0.bin") {
 .\.venv\Scripts\python.exe -c "import openwakeword.utils as u; u.download_models(['hey_jarvis'])"
 if ($LASTEXITCODE) { throw "Wake word model download failed." }
 
-# 3. Start Jarvis and its widget at every logon: a Task Scheduler task for this user (no admin needed)
+# 4. Sign in through Google's CLI using the account with Antigravity/Gemini access.
+Write-Host ""
+Write-Host "Antigravity sign-in: complete the Google account flow in the CLI, then type /exit or press Ctrl+D."
+Write-Host "The account session stays in your Windows credential store; Jarvis does not need an API key."
+Push-Location $env:TEMP
+try { & $agyPath } finally { Pop-Location }
+
+# 5. Start Jarvis and its widget at every logon: a Task Scheduler task for this user (no admin needed)
 $py = Join-Path $PSScriptRoot ".venv\Scripts\pythonw.exe"
 $me = "$env:USERDOMAIN\$env:USERNAME"
 $actions = @(
@@ -38,4 +59,4 @@ Start-ScheduledTask -TaskName "Jarvis"
 Write-Host ""
 Write-Host "Jarvis is installed and starting (the first start downloads whisper, give it a minute)."
 Write-Host "Dashboard: http://127.0.0.1:8765    Log: $PSScriptRoot\logs\jarvis.log"
-Write-Host "Make sure your model is set in config_local.py (see README) or Ollama is running."
+Write-Host "Default model: Gemini 3.8 Flash Medium through your signed-in Antigravity account."

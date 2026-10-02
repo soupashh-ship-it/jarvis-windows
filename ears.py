@@ -24,7 +24,7 @@ FRAME_S = FRAME / RATE
 
 # Whisper invents these on silence or noise
 JUNK = re.compile(r"^\W*(thank you|thanks for watching|you|bye|\.+|okay)?\W*$", re.I)
-NEAR_MISS = 0.05        # wake scores above this get logged, so a tester can see how close "hey jarvis" came
+WAKE_RMS_BLOCKS = 30    # match openWakeWord's 30-frame score history when its peak trails the phrase
 
 
 def describe(i):
@@ -83,14 +83,18 @@ class Ears:
         self.q = asyncio.Queue(maxsize=300)
         models_dir = os.path.join(os.path.dirname(openwakeword.__file__), "resources", "models")
         self.oww = Model(wakeword_models=[os.path.join(models_dir, "hey_jarvis_v0.1.onnx")],
-                         inference_framework="onnx")
+                         inference_framework="onnx", vad_threshold=config.WAKE_VAD_THRESHOLD)
         self.vad = VAD()
         self.last_score = 0.0
         self.mic_name = "?"
         if config.STT_ENGINE == "whisper":
             self.whisper = WhisperModel(config.WHISPER_MODEL, device="cpu", compute_type="int8")
             self.fast = WhisperModel("base.en", device="cpu", compute_type="int8")   # rough live text while you talk
-        self.peak = self.peak_level = 0.0
+        self.recent_rms = collections.deque(maxlen=WAKE_RMS_BLOCKS)
+        self.attempt_peak_score = self.attempt_peak_rms = 0.0
+        self.attempt_has_audio = False
+        self.attempt_quiet_blocks = 0
+        self.suppressed_logged = False
         self.dropped = 0                 # audio blocks lost (the mic overflowed, or Jarvis fell behind)
         log.info("microphones: %s", "; ".join(describe(i) for i, d in enumerate(sd.query_devices())
                                               if d["max_input_channels"] > 0))
@@ -105,9 +109,10 @@ class Ears:
 
     def start(self):
         self.stream.start()
-        log.info("mic open: %s, native %.0f Hz, recording %d Hz mono; wake threshold %.2f",
+        log.info("mic open: %s, native %.0f Hz, recording %d Hz mono; wake threshold %.2f; RMS gate %.0f over %.2f s; VAD %.2f",
                  describe(self.stream.device), sd.query_devices(self.stream.device)["default_samplerate"], RATE,
-                 config.WAKE_THRESHOLD)
+                 config.WAKE_THRESHOLD, config.WAKE_MIN_RMS, WAKE_RMS_BLOCKS * FRAME_S,
+                 config.WAKE_VAD_THRESHOLD)
 
     def _callback(self, indata, frames, t, status):
         if status.input_overflow:
@@ -123,21 +128,50 @@ class Ears:
     def heard_wake_word(self, chunk):
         score = max(self.oww.predict(chunk).values())
         self.last_score = score
-        if score >= NEAR_MISS:           # one log line per attempt: its best score and how loud the mic was
-            self.peak = max(self.peak, score)
-            self.peak_level = max(self.peak_level, float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2))) / 32768)
-        if score >= config.WAKE_THRESHOLD or (self.peak and score < NEAR_MISS):
-            log.info("wake score %.2f (threshold %.2f): %s; mic level %d%%, %d audio blocks dropped so far",
-                     self.peak, config.WAKE_THRESHOLD, "woke" if score >= config.WAKE_THRESHOLD else "missed",
-                     min(100, self.peak_level * 800), self.dropped)
-            self.peak = self.peak_level = 0.0
+        rms = float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2)))
+        self.recent_rms.append(rms)
+        recent_rms = max(self.recent_rms, default=0.0)
+        self.attempt_peak_score = max(self.attempt_peak_score, score)
+        self.attempt_peak_rms = max(self.attempt_peak_rms, rms)
+        if rms >= 8:
+            self.attempt_has_audio = True
+            self.attempt_quiet_blocks = 0
+        elif self.attempt_has_audio:
+            self.attempt_quiet_blocks += 1
         if score >= config.WAKE_THRESHOLD:
-            self.reset_wake()
-            return True
+            if recent_rms >= config.WAKE_MIN_RMS:
+                log.info("wake score %.2f (threshold %.2f): woke; recent RMS %.0f, %d audio blocks dropped",
+                         score, config.WAKE_THRESHOLD, recent_rms, self.dropped)
+                self.reset_wake()
+                return True
+            if not self.suppressed_logged:
+                log.info("wake candidate held: score %.2f; recent RMS %.0f below speech gate %.0f",
+                         score, recent_rms, config.WAKE_MIN_RMS)
+                self.suppressed_logged = True
+        if self.attempt_has_audio and self.attempt_quiet_blocks >= WAKE_RMS_BLOCKS:
+            self.finish_wake_attempt("speech ended")
+            self.oww.reset()
+            self.recent_rms.clear()
         return False
+
+    def finish_wake_attempt(self, reason="manual activation"):
+        """Preserve score and signal level when a manual trigger interrupts a missed wake attempt."""
+        if self.attempt_has_audio:
+            log.info("wake attempt %s: peak score %.2f / %.2f threshold; peak RMS %.0f / %.0f speech gate",
+                     reason, self.attempt_peak_score, config.WAKE_THRESHOLD,
+                     self.attempt_peak_rms, config.WAKE_MIN_RMS)
+        self._clear_wake_attempt()
 
     def reset_wake(self):
         self.oww.reset()
+        self.recent_rms.clear()
+        self._clear_wake_attempt()
+
+    def _clear_wake_attempt(self):
+        self.attempt_peak_score = self.attempt_peak_rms = 0.0
+        self.attempt_has_audio = False
+        self.attempt_quiet_blocks = 0
+        self.suppressed_logged = False
 
     def recorder(self, wait_for_speech):
         return Recorder(self.vad, wait_for_speech)

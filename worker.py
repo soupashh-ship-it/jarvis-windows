@@ -68,6 +68,8 @@ class Worker:
             log.exception("worker %s died", self.name)
             self.last = f"It crashed: {e}"
             self.set("failed")
+        finally:
+            await self.agent.close()
         self.tell()
 
 

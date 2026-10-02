@@ -31,7 +31,7 @@ import events
 import winapi
 import worker
 from brain import Brain, read_notes, read_state, summarize, write_state
-from ears import Ears
+from ears import Ears, FRAME_S, RATE
 from mouth import Mouth
 
 IDLE, LISTEN, BUSY = "idle", "listening", "busy"
@@ -39,6 +39,12 @@ YES = re.compile(r"\b(yes|yeah|yep|yup|sure|go ahead|do it|confirm(ed)?|affirmat
 NEW_SESSION = re.compile(r"^\W*(please\W+)?(start\W+)?(a\W+)?(new|fresh)\W+(session|chat|conversation|start)\W*(please)?\W*$"
                          r"|^\W*fresh start\W*$", re.I)
 NO = re.compile(r"\b(no|nope|don'?t|stop|cancel|wait|hold on|never ?mind)\b", re.I)
+WAKE_PHRASE = re.compile(r"^\s*hey[\s,.;:-]+jarvis\b[\s,.:;!?-]*(.*)$", re.I)
+IDLE_WAKE_END_BLOCKS = 8                    # tolerate the pause between "Hey" and "Jarvis"
+IDLE_WAKE_PREROLL_BLOCKS = 8                # retain 640 ms before VAD opens, including soft consonants
+IDLE_WAKE_MIN_RMS = 32                       # lower than the OpenWakeWord gate for ordinary speech
+IDLE_WAKE_VAD_THRESHOLD = 0.15
+IDLE_WAKE_MAX_BLOCKS = int(6 / FRAME_S)     # bound local fallback transcription to a short clip
 
 
 def time_tag():
@@ -107,6 +113,10 @@ class Jarvis:
         self.talk_frames = collections.deque(maxlen=15)
         self.talk_run = 0
         self.partial_busy = False
+        self.wake_preroll = collections.deque(maxlen=IDLE_WAKE_PREROLL_BLOCKS)
+        self.wake_clip = []
+        self.wake_quiet_blocks = 0
+        self.wake_fallback_busy = False
         self.mouth.on_sentence_start = lambda text: events.emit("speaking_now", text=text)
         self.live = {"you": "", "said": "", "step": "", "self_started": False}
         events.listen(self.track_live)
@@ -185,7 +195,10 @@ class Jarvis:
         self.state = LISTEN
         log.info("listening%s", " for yes/no" if target else "")
 
-    async def wake(self, how="wake word"):
+    async def wake(self, how="wake word", command=None):
+        if how == "button":
+            self.ears.finish_wake_attempt("manual trigger")
+            self.clear_idle_wake_audio()
         events.emit("wake", how=how, score=round(self.wake_score, 2))
         if self.pending_confirm and not self.pending_confirm.done():
             self.pending_confirm.set_result("")
@@ -196,20 +209,89 @@ class Jarvis:
             if self.processing:
                 await self.brain.interrupt()
         self.mouth.chime("wake")
-        self.begin_listen(None, config.WAIT_FOR_SPEECH_S)
+        if command:
+            self.state = BUSY
+            self.inbox.put_nowait(("voice", command))
+        else:
+            self.begin_listen(None, config.WAIT_FOR_SPEECH_S)
+
+    def clear_idle_wake_audio(self):
+        self.wake_preroll.clear()
+        self.wake_clip.clear()
+        self.wake_quiet_blocks = 0
+
+    def collect_idle_wake_audio(self, chunk, rms, vad_score):
+        """Buffer idle speech briefly for a local STT fallback when the acoustic wake model misses."""
+        if config.STT_ENGINE != "whisper":
+            return
+        if self.wake_fallback_busy:
+            self.wake_preroll.clear()
+            return
+        speech = rms >= IDLE_WAKE_MIN_RMS and vad_score >= IDLE_WAKE_VAD_THRESHOLD
+        if speech:
+            if not self.wake_clip:
+                self.wake_clip = list(self.wake_preroll)
+            self.wake_clip.append(chunk.copy())
+            self.wake_quiet_blocks = 0
+            if len(self.wake_clip) >= IDLE_WAKE_MAX_BLOCKS:
+                self.finish_idle_wake_audio()
+            return
+        if not self.wake_clip:
+            self.wake_preroll.append(chunk.copy())
+            return
+        self.wake_clip.append(chunk.copy())
+        self.wake_quiet_blocks += 1
+        if self.wake_quiet_blocks >= IDLE_WAKE_END_BLOCKS:
+            self.finish_idle_wake_audio()
+        self.wake_preroll.append(chunk.copy())
+
+    def finish_idle_wake_audio(self):
+        if len(self.wake_clip) < 5:
+            self.clear_idle_wake_audio()
+            return
+        audio = np.concatenate(self.wake_clip)
+        self.clear_idle_wake_audio()
+        self.wake_fallback_busy = True
+        self.loop.create_task(self.check_idle_wake_phrase(audio))
+
+    async def check_idle_wake_phrase(self, audio):
+        try:
+            text = await self.ears.partial(audio)
+            match = WAKE_PHRASE.match(text or "")
+            if not match:
+                log.info("local wake fallback found no Hey Jarvis phrase in %.2f s of speech",
+                         len(audio) / RATE)
+                return
+            if self.state != IDLE or self.processing or self.mouth.busy:
+                return
+            command = match.group(1).strip()
+            log.info("local speech fallback recognized Hey Jarvis%s",
+                     " followed by a command" if command else "")
+            await self.wake(how="local speech fallback", command=command or None)
+        except Exception:
+            log.exception("local wake phrase fallback failed")
+        finally:
+            self.wake_fallback_busy = False
 
     async def audio_loop(self):
         while True:
             chunk = await self.ears.q.get()
-            self.level = max(self.level * 0.6, float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2))) / 32768)
+            rms = float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2)))
+            self.level = max(self.level * 0.6, rms / 32768)
             self.zero_blocks = 0 if chunk.any() else self.zero_blocks + 1
             if self.zero_blocks == 63:                 # 5 s of digital silence
                 self.mic_silent()
             if self.state != LISTEN:
                 if self.ears.heard_wake_word(chunk):
+                    self.clear_idle_wake_audio()
                     await self.wake()
                     continue
                 self.wake_score = self.ears.last_score
+                if self.state == IDLE and not self.processing and not self.mouth.busy:
+                    vad_score = self.ears.vad.predict(chunk, frame_size=640)
+                    self.collect_idle_wake_audio(chunk, rms, vad_score)
+                else:
+                    self.clear_idle_wake_audio()
                 if config.BARGE_IN_BY_VOICE and self.mouth.busy:
                     await self.check_talk_over(chunk)
                 else:
@@ -313,7 +395,10 @@ class Jarvis:
             except Exception as e:
                 log.exception("brain failed")
                 events.emit("error", where="brain", error=str(e))
-                self.mouth.say(f"I'm afraid something went wrong on my end, {config.HONORIFIC}.")
+                if str(e).startswith("model error 503:"):
+                    self.mouth.say(f"The model service is busy right now, {config.HONORIFIC}. Please try again in a moment.")
+                else:
+                    self.mouth.say(f"I'm afraid something went wrong on my end, {config.HONORIFIC}.")
             await self.mouth.wait_done()
             self.processing, self.turn = False, None
             self.last_activity = time.time()
@@ -454,7 +539,9 @@ class Jarvis:
                             "resetting": self.resetting},
                 "notes": {"text": read_notes(), "updated": os.path.getmtime(config.NOTES_FILE)
                           if os.path.exists(config.NOTES_FILE) else None},
-                "config": {"model": config.LLM_MODEL, "provider": config.LLM_BASE_URL, "voice": config.VOICE,
+                "config": {"model": config.LLM_MODEL,
+                           "provider": "Antigravity subscription" if config.LLM_PROVIDER == "antigravity" else config.LLM_BASE_URL,
+                           "voice": config.VOICE,
                            "whisper": config.WHISPER_MODEL if config.STT_ENGINE == "whisper" else config.STT_MODEL,
                            "wake_threshold": config.WAKE_THRESHOLD,
                            "mic": self.ears.mic_name}}
@@ -484,6 +571,7 @@ async def main():
     await jarvis.brain.interrupt()
     await worker.stop_all()
     await jarvis.save_notes()
+    await jarvis.brain.close()
 
 
 if __name__ == "__main__":

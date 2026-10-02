@@ -16,13 +16,15 @@ CITY = "London"            # for the weather line in the morning greeting (wttr.
 # Folders Jarvis may write to without asking (plus your home folder)
 WRITE_OK_DIRS = []
 
-# Brain: any OpenAI-compatible chat completions endpoint that supports tool calling.
-# Default is a local Ollama model, so nothing leaves your PC. Examples for other providers are in the README.
+# Brain: the official Antigravity CLI uses the Google account you sign in with (no API key).
+# Set LLM_PROVIDER to "openai-compatible" to use Ollama or another compatible endpoint instead.
+LLM_PROVIDER = "antigravity"
+ANTIGRAVITY_CLI = os.environ.get("JARVIS_ANTIGRAVITY_CLI", "")  # optional path when agy isn't on PATH
 LLM_BASE_URL = "http://localhost:11434/v1"
 LLM_API_KEY = os.environ.get("JARVIS_LLM_API_KEY", "")   # or set it in config_local.py
-LLM_MODEL = "qwen3-vl:8b"
+LLM_MODEL = "gemini-3.8-flash-medium"
 LLM_VISION = True          # False if the model can't read images (Jarvis then can't look at screenshots)
-WORKER_MODEL = ""          # model for background workers; "" = same as LLM_MODEL
+WORKER_MODEL = ""          # optional model for background workers; "" = same as LLM_MODEL
 MAX_STEPS = 30             # tool calls per request before Jarvis gives up
 SESSION_IDLE_RESET_MIN = 30   # after this long with nothing going on, the next request gets a fresh session
 NOTES_FILE = os.path.join(JARVIS_DIR, "notes.md")   # running summary carried from session to session
@@ -31,6 +33,8 @@ PERSONA_FILE = os.path.join(JARVIS_DIR, "persona.md")
 # Ears
 MIC_DEVICE = None          # None = system default input, or a device name/number from: python -m sounddevice
 WAKE_THRESHOLD = 0.5       # raise if it wakes by itself, lower if it misses you
+WAKE_MIN_RMS = 80          # minimum recent PCM RMS for a wake; filters model spikes on digital silence
+WAKE_VAD_THRESHOLD = 0.2   # OpenWakeWord's speech-activity gate; rejects wake scores on non-speech noise
 WAIT_FOR_SPEECH_S = 6.0    # after "hey jarvis", how long to wait for you to start talking
 END_SILENCE_S = 1.6        # this much silence = you've finished talking (lower values cut people off mid-thought)
 MAX_UTTERANCE_S = 45.0

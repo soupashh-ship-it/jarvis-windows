@@ -203,8 +203,9 @@ class Widget(QWidget):
         """What to show: (label, text, dim, footer, task_lines, compact). Same wording as always."""
         a = self.activity
         label, text, dim, footer, lines = LABELS.get(a, a), "", False, "", None
-        if self.tasks and a != "idle" and now < self.note_until:
-            footer = f"+{len(self.tasks)} in the background"
+        if self.tasks and a != "idle":
+            elapsed = short_dur(now - min(t["started"] for t in self.tasks.values()))
+            footer = f"Background work · {elapsed}"
         if a == "listening":
             label, text = "You", self.you or "..."
         elif a == "thinking":
@@ -217,12 +218,12 @@ class Widget(QWidget):
             text = self.said or "..."
         elif a == "waiting":
             text = self.question
-        elif a == "idle" and self.said and now < self.linger_until:
-            label, text, dim = "Jarvis", self.said, True
         elif a == "idle" and self.tasks:
-            label = f"Working in the background ({len(self.tasks)})"
+            label = "Working"
             lines = [(short_dur(now - t["started"]), t["description"] or "Background job")
                      for t in sorted(self.tasks.values(), key=lambda t: t["started"])[:3]]
+        elif a == "idle" and self.said and now < self.linger_until:
+            label, text, dim = "Jarvis", self.said, True
         elif a == "idle":
             text, dim = "Say “Hey Jarvis”", True
         elif a == "offline":
@@ -239,7 +240,7 @@ class Widget(QWidget):
             setattr(self, name, cur + (raw - cur) * (0.5 if raw > cur else 0.12))
         if self.activity in ACTIVE:
             self.linger_until = now + LINGER_S
-        show = self.activity in ACTIVE or now < self.linger_until or now < self.note_until
+        show = self.activity in ACTIVE or bool(self.tasks) or now < self.linger_until or now < self.note_until
         self.presence.target = 100 if show else 0
         if show or self.content is None:   # while tucking away, keep showing what was there
             self.content = self.compose(now)
@@ -373,6 +374,9 @@ class Widget(QWidget):
     def draw_rest(self, p, cap, k):
         """The resting pill: a tiny dim mic in the middle, plus a faint dot while background work runs."""
         c = cap.center()
+        if self.activity == "idle" and self.tasks:
+            self.draw_sun(p, c, 8)
+            return
         col = d.alpha(d.LABEL, (0.22 if self.activity == "offline" else 0.42) * k)
         p.setPen(Qt.NoPen)
         p.setBrush(col)
@@ -401,6 +405,9 @@ class Widget(QWidget):
         icon = QPointF(cap.left() + 31, cap.top() + 32)
         if self.bare(self.content):
             left = cap.left() + 22
+        elif a == "idle" and lines:
+            self.draw_sun(p, icon, 12)
+            left = cap.left() + 62
         elif a == "listening":
             self.draw_mic(p, icon)
             left = cap.left() + 62
@@ -483,6 +490,24 @@ class Widget(QWidget):
         p.drawPath(cradle)
         p.drawLine(QPointF(c.x(), c.y() + 4.6 * s), QPointF(c.x(), c.y() + 8 * s))
         p.drawLine(QPointF(c.x() - 3.2 * s, c.y() + 8 * s), QPointF(c.x() + 3.2 * s, c.y() + 8 * s))
+
+    def draw_sun(self, p, c, scale=12):
+        """A warm, understated sun mark for ongoing background work."""
+        orange = d.color("waiting")
+        halo = QRadialGradient(c, scale * 1.8)
+        halo.setColorAt(0, d.alpha(orange, 0.28))
+        halo.setColorAt(1, d.alpha(orange, 0))
+        p.setPen(Qt.NoPen)
+        p.setBrush(halo)
+        p.drawEllipse(c, scale * 1.8, scale * 1.8)
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(orange, max(1.5, scale * 0.14), Qt.SolidLine, Qt.RoundCap))
+        p.drawEllipse(c, scale * 0.32, scale * 0.32)
+        for i in range(8):
+            angle = math.tau * i / 8
+            inner, outer = scale * 0.58, scale * 0.82
+            p.drawLine(QPointF(c.x() + math.cos(angle) * inner, c.y() + math.sin(angle) * inner),
+                       QPointF(c.x() + math.cos(angle) * outer, c.y() + math.sin(angle) * outer))
 
     def draw_orb(self, p, c, r):
         """The orb: Jarvis's face. It swirls while thinking and breathes while waiting for an answer."""

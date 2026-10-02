@@ -1,10 +1,15 @@
 """The brain: any chat model behind an OpenAI-compatible endpoint, a small tool loop, and a spoken permission gate."""
 import asyncio
+import base64
+import collections
 import json
 import logging
 import os
 import re
+import shutil
+import subprocess
 import string
+import tempfile
 import time
 import uuid
 
@@ -33,6 +38,43 @@ def ids_of(calls):
     return [c["id"] for c in calls]
 
 
+_TEXT_TOOL = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.S)
+
+
+def _text_tool_calls(said):
+    """Some OpenAI-compatible proxies (e.g. Antigravity bridges) return tool calls as text
+    JSON (```json {"name": ..., "arguments": {...}}``` or {"tool_calls": [...]}) instead of
+    structured delta.tool_calls. Convert those so the agent loop can run them."""
+    calls = []
+
+    def add(name, args):
+        if not isinstance(name, str) or not name:
+            return
+        try:
+            argstr = json.dumps(args) if isinstance(args, dict) else str(args or "{}")
+        except Exception:
+            argstr = "{}"
+        calls.append({"id": "call_" + uuid.uuid4().hex[:12], "type": "function",
+                      "function": {"name": name, "arguments": argstr}})
+
+    cleaned = said
+    for m in _TEXT_TOOL.finditer(said):
+        try:
+            obj = json.loads(m.group(1))
+        except ValueError:
+            continue
+        items = obj.get("tool_calls") if isinstance(obj, dict) and isinstance(obj.get("tool_calls"), list) else [obj]
+        before = len(calls)
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            fn = it.get("function") if isinstance(it.get("function"), dict) else it
+            add(fn.get("name"), fn.get("arguments", {}))
+        if len(calls) > before:
+            cleaned = cleaned.replace(m.group(0), " ")
+    return calls, re.sub(r"\s+", " ", cleaned).strip()
+
+
 async def chat(messages, tools=None, on_text=None, model=None):
     """One streamed chat completion. Returns the assistant message: its text plus any tool calls."""
     body = {"model": model or config.LLM_MODEL, "messages": messages, "stream": True}
@@ -41,42 +83,466 @@ async def chat(messages, tools=None, on_text=None, model=None):
     headers = {"Authorization": f"Bearer {config.LLM_API_KEY}"} if config.LLM_API_KEY else {}
     said, calls = "", []
     timeout = aiohttp.ClientTimeout(sock_connect=15, sock_read=300)
-    async with aiohttp.ClientSession(timeout=timeout) as s, \
-            s.post(config.LLM_BASE_URL.rstrip("/") + "/chat/completions", json=body, headers=headers) as r:
-        if r.status != 200:
-            raise RuntimeError(f"model error {r.status}: {(await r.text())[:500]}")
-        async for line in r.content:
-            line = line.decode("utf-8", "replace").strip()
-            if not line.startswith("data:") or line[5:].strip() == "[DONE]":
+    url = config.LLM_BASE_URL.rstrip("/") + "/chat/completions"
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        for attempt in range(3):
+            r = await s.post(url, json=body, headers=headers)
+            if r.status == 503 and attempt < 2:
+                await r.read()
+                retry_after = r.headers.get("Retry-After")
+                try:
+                    delay = min(5.0, max(0.5, float(retry_after))) if retry_after else 1.0 + attempt
+                except ValueError:
+                    delay = 1.0 + attempt
+                r.release()
+                log.warning("model returned HTTP 503; retrying attempt %d/3 in %.1fs", attempt + 2, delay)
+                await asyncio.sleep(delay)
                 continue
-            chunk = json.loads(line[5:])
-            if chunk.get("error"):
-                raise RuntimeError(f"model error: {chunk['error']}")
-            delta = ((chunk.get("choices") or [{}])[0]).get("delta") or {}
-            if delta.get("content"):
-                said += delta["content"]
-                if on_text:
-                    on_text(delta["content"])
-            for tc in delta.get("tool_calls") or []:
-                f, i = tc.get("function") or {}, tc.get("index")
-                if i is None:   # Gemini leaves the index out (and may repeat or blank the id): a name starts a new call
-                    ids = ids_of(calls)
-                    i = (len(calls) if f.get("name") or not calls else ids.index(tc["id"]) if tc.get("id") in ids
-                         else len(calls) if tc.get("id") else len(calls) - 1)
-                while len(calls) <= i:
-                    calls.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
-                c = calls[i]
-                if not c["id"]:                     # every call needs its own id for its tool message
-                    c["id"] = tc["id"] if tc.get("id") and tc["id"] not in ids_of(calls) else "call_" + uuid.uuid4().hex[:12]
-                c["function"]["name"] = c["function"]["name"] or f.get("name") or ""
-                c["function"]["arguments"] += f.get("arguments") or ""
-                # anything else rides along unchanged: Gemini 3 rejects the next request unless its
-                # extra_content.google.thought_signature comes back on the call
-                c.update({k: v for k, v in tc.items() if k not in ("index", "id", "type", "function")})
-    msg = {"role": "assistant", "content": said or (None if calls else "")}
+            async with r:
+                if r.status != 200:
+                    raise RuntimeError(f"model error {r.status}: {(await r.text())[:500]}")
+                async for line in r.content:
+                    line = line.decode("utf-8", "replace").strip()
+                    if not line.startswith("data:") or line[5:].strip() == "[DONE]":
+                        continue
+                    chunk = json.loads(line[5:])
+                    if chunk.get("error"):
+                        raise RuntimeError(f"model error: {chunk['error']}")
+                    delta = ((chunk.get("choices") or [{}])[0]).get("delta") or {}
+                    if delta.get("content"):
+                        said += delta["content"]
+                        if on_text:
+                            on_text(delta["content"])
+                    for tc in delta.get("tool_calls") or []:
+                        f, i = tc.get("function") or {}, tc.get("index")
+                        if i is None:   # Gemini leaves the index out (and may repeat or blank the id): a name starts a new call
+                            ids = ids_of(calls)
+                            i = (len(calls) if f.get("name") or not calls else ids.index(tc["id"]) if tc.get("id") in ids
+                                 else len(calls) if tc.get("id") else len(calls) - 1)
+                        while len(calls) <= i:
+                            calls.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                        c = calls[i]
+                        if not c["id"]:                     # every call needs its own id for its tool message
+                            c["id"] = tc["id"] if tc.get("id") and tc["id"] not in ids_of(calls) else "call_" + uuid.uuid4().hex[:12]
+                        c["function"]["name"] = c["function"]["name"] or f.get("name") or ""
+                        c["function"]["arguments"] += f.get("arguments") or ""
+                        # anything else rides along unchanged: Gemini 3 rejects the next request unless its
+                        # extra_content.google.thought_signature comes back on the call
+                        c.update({k: v for k, v in tc.items() if k not in ("index", "id", "type", "function")})
+            break
+    if not calls and said:                       # proxy sent tools as text JSON: convert them
+        tcalls, said = _text_tool_calls(said)
+        if tcalls:
+            log.info("text tool calls: %s", [c["function"]["name"] for c in tcalls])
+            calls = tcalls
+    msg = {"role": "assistant", "content": said or ""}  # "" not None: some proxies reject null content; empty replies are dropped by Agent
     if calls:
         msg["tool_calls"] = calls
     return msg
+
+
+class _JSONTextStreamer:
+    """Stream the top-level JSON `text` string as it is generated, decoding JSON escapes."""
+
+    def __init__(self, callback):
+        self.callback = callback
+        self.raw = ""
+        self.pos = 0
+        self.value_start = None
+        self.escaped = False
+        self.unicode_digits = None
+        self.pending_high_surrogate = None
+        self.text = ""
+        self.done = False
+
+    def _emit_char(self, char, out):
+        code = ord(char)
+        if self.pending_high_surrogate is not None:
+            high = ord(self.pending_high_surrogate)
+            if 0xDC00 <= code <= 0xDFFF:
+                out.append(chr(0x10000 + ((high - 0xD800) << 10) + code - 0xDC00))
+                self.pending_high_surrogate = None
+                return
+            out.append(self.pending_high_surrogate)
+            self.pending_high_surrogate = None
+        if 0xD800 <= code <= 0xDBFF:
+            self.pending_high_surrogate = char
+        else:
+            out.append(char)
+
+    def feed(self, delta):
+        if self.done or not delta:
+            return
+        self.raw += delta
+        if self.value_start is None:
+            start = len(self.raw) - len(self.raw.lstrip())
+            if not self.raw[start:].startswith("{"):
+                return
+            match = re.search(r'"text"\s*:\s*"', self.raw[start + 1:])
+            if not match:
+                return
+            self.value_start = start + 1 + match.end()
+            self.pos = self.value_start
+
+        out = []
+        while self.pos < len(self.raw):
+            char = self.raw[self.pos]
+            self.pos += 1
+            if self.unicode_digits is not None:
+                self.unicode_digits += char
+                if len(self.unicode_digits) == 4:
+                    try:
+                        self._emit_char(chr(int(self.unicode_digits, 16)), out)
+                    except ValueError:
+                        pass
+                    self.unicode_digits = None
+                continue
+            if self.escaped:
+                self.escaped = False
+                if char == "u":
+                    self.unicode_digits = ""
+                else:
+                    self._emit_char({"\"": "\"", "\\": "\\", "/": "/", "b": "\b",
+                                     "f": "\f", "n": "\n", "r": "\r", "t": "\t"}.get(char, char), out)
+                continue
+            if char == "\\":
+                self.escaped = True
+            elif char == '"':
+                self.done = True
+                if self.pending_high_surrogate is not None:
+                    out.append(self.pending_high_surrogate)
+                    self.pending_high_surrogate = None
+                break
+            else:
+                self._emit_char(char, out)
+        if out:
+            piece = "".join(out)
+            self.text += piece
+            self.callback(piece)
+
+
+class AntigravitySession:
+    """A persistent official Antigravity CLI session using the signed-in subscription."""
+
+    RESPONSE_RULES = """You are Jarvis's model backend. Jarvis, not this CLI, owns all user-facing actions and tool execution.
+Never use Antigravity tools to operate the user's computer, browse, run commands, or edit files. Return exactly one JSON object with:
+- text: the words Jarvis should say (a string; empty when requesting a tool)
+- tool_calls: an array of {name, arguments} objects, using only the Jarvis tools supplied in the request; arguments must be an object
+Use an empty tool_calls array when you can answer. Do not use markdown fences or add text outside the JSON object.
+If a Jarvis message includes a screenshot path, inspect only that image with the read-only view_file tool, then return the JSON object. Do not inspect any other files."""
+
+    def __init__(self, model=None):
+        self.model = model or config.LLM_MODEL
+        self.proc = None
+        self.workdir = None
+        self._queue = asyncio.Queue()
+        self._ready = asyncio.Event()
+        self._start_lock = asyncio.Lock()
+        self._turn_lock = asyncio.Lock()
+        self._reader_task = None
+        self._stderr_task = None
+        self._stderr_tail = collections.deque(maxlen=30)
+        self._startup_error = None
+        self._messages_sent = 0
+        self._turns = 0
+        self._prompt_chars = 0
+
+    @staticmethod
+    def _executable():
+        configured = getattr(config, "ANTIGRAVITY_CLI", "") or os.environ.get("JARVIS_ANTIGRAVITY_CLI", "")
+        candidates = [configured, shutil.which("agy")]
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if local_app_data:
+            candidates.append(os.path.join(local_app_data, "agy", "bin", "agy.exe"))
+        for path in candidates:
+            if path and (os.path.isfile(path) if os.path.dirname(path) else shutil.which(path)):
+                return path
+        raise RuntimeError("Antigravity CLI (agy) was not found. Install it and sign in with your Antigravity account.")
+
+    def _prepare_workspace(self):
+        self.workdir = tempfile.mkdtemp(prefix="jarvis-antigravity-")
+        agent_dir = os.path.join(self.workdir, ".agents", "agents", "jarvis-model")
+        os.makedirs(agent_dir, exist_ok=True)
+        agent = """---
+name: jarvis-model
+description: Jarvis voice assistant response model
+tools:
+  - view_file
+mainAgent: true
+subagent: false
+commandExecutionPolicy: off
+---
+Produce structured response text for Jarvis. Do not take actions with CLI tools. Only inspect screenshot paths explicitly supplied by Jarvis, using view_file.
+"""
+        with open(os.path.join(agent_dir, "agent.md"), "w", encoding="utf-8", newline="\n") as f:
+            f.write(agent)
+
+    async def start(self):
+        async with self._start_lock:
+            if self.proc and self.proc.returncode is None:
+                if not self._ready.is_set():
+                    await asyncio.wait_for(self._ready.wait(), 60)
+                if self._startup_error:
+                    raise self._startup_error
+                return
+
+            self._queue = asyncio.Queue()
+            self._ready = asyncio.Event()
+            self._startup_error = None
+            self._stderr_tail.clear()
+            self._messages_sent = self._turns = self._prompt_chars = 0
+            self._prepare_workspace()
+            args = [self._executable(), "--input-format", "stream-json", "--output-format", "stream-json",
+                    "--model", self.model, "--agent", "jarvis-model"]
+            create_kwargs = {}
+            if os.name == "nt":
+                create_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            env = os.environ.copy()
+            env.pop("JARVIS_LLM_API_KEY", None)
+            try:
+                self.proc = await asyncio.create_subprocess_exec(
+                    *args, cwd=self.workdir, stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env, **create_kwargs)
+            except Exception:
+                shutil.rmtree(self.workdir, ignore_errors=True)
+                self.workdir = None
+                raise
+            self._reader_task = asyncio.create_task(self._read_stdout())
+            self._stderr_task = asyncio.create_task(self._read_stderr())
+            try:
+                await asyncio.wait_for(self._ready.wait(), 60)
+            except asyncio.TimeoutError as e:
+                await self._terminate()
+                raise RuntimeError("Antigravity CLI did not become ready within 60 seconds.") from e
+            if self._startup_error:
+                error = self._startup_error
+                await self._terminate()
+                raise error
+            log.info("Antigravity CLI ready with %s", self.model)
+
+    async def _read_stdout(self):
+        try:
+            while self.proc and self.proc.stdout:
+                line = await self.proc.stdout.readline()
+                if not line:
+                    break
+                try:
+                    event = json.loads(line.decode("utf-8", "replace"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    log.warning("Antigravity CLI emitted a non-JSON output line")
+                    continue
+                if event.get("event") == "init":
+                    self._ready.set()
+                await self._queue.put(event)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self._startup_error = RuntimeError(f"Antigravity CLI output failed: {e}")
+            log.exception("Antigravity CLI output reader failed")
+        finally:
+            if not self._ready.is_set():
+                self._startup_error = self._startup_error or RuntimeError("Antigravity CLI exited before it became ready.")
+                self._ready.set()
+            await self._queue.put(None)
+
+    async def _read_stderr(self):
+        try:
+            while self.proc and self.proc.stderr:
+                line = await self.proc.stderr.readline()
+                if not line:
+                    break
+                self._stderr_tail.append(line.decode("utf-8", "replace").rstrip())
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Antigravity CLI stderr reader failed")
+
+    def _image_path(self, url):
+        match = re.match(r"^data:(image/[\w.+-]+);base64,(.*)$", url, re.S)
+        if not match:
+            return "[image omitted: unsupported screenshot format]"
+        mime, encoded = match.groups()
+        ext = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}.get(mime, ".img")
+        try:
+            data = base64.b64decode(encoded, validate=True)
+        except (ValueError, base64.binascii.Error):
+            return "[image omitted: invalid image data]"
+        path = os.path.join(self.workdir, "jarvis-screen-" + uuid.uuid4().hex + ext)
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
+
+    def _message_for_cli(self, message):
+        item = {"role": message.get("role", "user")}
+        content = message.get("content", "")
+        if isinstance(content, list):
+            parts = []
+            for block in content:
+                if block.get("type") == "text":
+                    parts.append(block.get("text", ""))
+                elif block.get("type") == "image_url":
+                    url = (block.get("image_url") or {}).get("url", "")
+                    parts.append("SCREENSHOT PATH (view_file only): " + self._image_path(url))
+            item["content"] = "\n".join(parts)
+        else:
+            item["content"] = content
+        if message.get("tool_call_id"):
+            item["tool_call_id"] = message["tool_call_id"]
+        if message.get("tool_calls"):
+            item["tool_calls"] = message["tool_calls"]
+        return item
+
+    def _prompt(self, messages, tools):
+        if not self._messages_sent:
+            normalized = [self._message_for_cli(m) for m in messages]
+            payload = {"messages": normalized, "jarvis_tools": tools or []}
+            header = "Handle this Jarvis request. The first message with role system is Jarvis's instruction.\n"
+        else:
+            normalized = [self._message_for_cli(m) for m in messages[self._messages_sent:]]
+            payload = {"new_messages": normalized}
+            header = "Continue the same Jarvis conversation using these new messages. Previous turns and tool specs remain in context.\n"
+        return self.RESPONSE_RULES + "\n\n" + header + json.dumps(payload, ensure_ascii=False)
+
+    async def _read_result(self, on_text=None):
+        streamer = _JSONTextStreamer(on_text) if on_text else None
+        while True:
+            event = await self._queue.get()
+            if event is None:
+                details = "\n".join(self._stderr_tail)
+                suffix = f" Antigravity CLI said: {details[-1200:]}" if details else ""
+                raise RuntimeError("Antigravity CLI stopped before returning a response." + suffix)
+            if event.get("event") == "step_update" and streamer:
+                step = event.get("step_update") or {}
+                if step.get("step_type") == "agent_response":
+                    streamer.feed(step.get("text_delta", ""))
+                continue
+            if event.get("event") != "result":
+                continue
+            result = event.get("result") or {}
+            if result.get("status") != "SUCCESS":
+                reason = result.get("error") or result.get("response") or "unknown model error"
+                details = "\n".join(self._stderr_tail)
+                if details:
+                    reason += " " + details[-1200:]
+                raise RuntimeError(f"Antigravity subscription request failed: {reason[:1800]}")
+            return result, streamer.text if streamer else ""
+
+    @staticmethod
+    def _decode_response(result):
+        response = result.get("response", "") or ""
+        structured = result.get("structured_output")
+        obj = structured if isinstance(structured, dict) else None
+        if obj is None:
+            decoder = json.JSONDecoder()
+            for match in re.finditer(r"\{", response):
+                try:
+                    candidate, _ = decoder.raw_decode(response[match.start():])
+                except ValueError:
+                    continue
+                if isinstance(candidate, dict) and ("text" in candidate or "tool_calls" in candidate):
+                    obj = candidate
+                    break
+        if obj is None:
+            msg_text = response.strip()
+            calls, msg_text = _text_tool_calls(msg_text)
+            return {"role": "assistant", "content": msg_text, **({"tool_calls": calls} if calls else {})}
+
+        said = obj.get("text", obj.get("content", ""))
+        if not isinstance(said, str):
+            said = str(said or "")
+        calls = []
+        for item in obj.get("tool_calls", obj.get("calls", [])) or []:
+            if not isinstance(item, dict):
+                continue
+            function = item.get("function") if isinstance(item.get("function"), dict) else item
+            name = function.get("name")
+            args = function.get("arguments", {})
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except ValueError:
+                    continue
+            if isinstance(name, str) and name and isinstance(args, dict):
+                calls.append({"id": "call_" + uuid.uuid4().hex[:12], "type": "function",
+                              "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
+        msg = {"role": "assistant", "content": said}
+        if calls:
+            msg["tool_calls"] = calls
+        return msg
+
+    async def chat(self, messages, tools=None, on_text=None):
+        async with self._turn_lock:
+            if self._turns >= 40 or self._prompt_chars > 100_000:
+                await self._terminate()
+            await self.start()
+            prompt = self._prompt(messages, tools)
+            try:
+                self.proc.stdin.write((json.dumps({"event": "user", "message": {"content": prompt}},
+                                                 ensure_ascii=False) + "\n").encode("utf-8"))
+                await self.proc.stdin.drain()
+                self._messages_sent = len(messages)
+                result, streamed_text = await self._read_result(on_text)
+            except asyncio.CancelledError:
+                await self._terminate()
+                raise
+            except Exception:
+                await self._terminate()
+                raise
+            self._turns += 1
+            self._prompt_chars += len(prompt)
+            msg = self._decode_response(result)
+            if on_text and msg.get("content"):
+                if not streamed_text:
+                    on_text(msg["content"])
+                elif msg["content"].startswith(streamed_text):
+                    remaining = msg["content"][len(streamed_text):]
+                    if remaining:
+                        on_text(remaining)
+            return msg
+
+    async def _terminate(self):
+        proc = self.proc
+        self.proc = None
+        if proc and proc.returncode is None:
+            try:
+                if proc.stdin and not proc.stdin.is_closing():
+                    proc.stdin.close()
+                await asyncio.wait_for(proc.wait(), 4)
+            except (asyncio.TimeoutError, Exception):
+                try:
+                    proc.kill()
+                    await asyncio.wait_for(proc.wait(), 3)
+                except Exception:
+                    pass
+        for task in (self._reader_task, self._stderr_task):
+            if task and not task.done():
+                task.cancel()
+        for task in (self._reader_task, self._stderr_task):
+            if task:
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+        if self.workdir:
+            shutil.rmtree(self.workdir, ignore_errors=True)
+        self.workdir = None
+        self._queue = asyncio.Queue()
+        self._ready = asyncio.Event()
+        self._reader_task = self._stderr_task = None
+        self._startup_error = None
+        self._messages_sent = self._turns = self._prompt_chars = 0
+
+    async def close(self):
+        async with self._turn_lock:
+            async with self._start_lock:
+                await self._terminate()
+
+    async def warm(self):
+        """Start the CLI process without spending subscription quota on a warm-up prompt."""
+        try:
+            await self.start()
+        except Exception:
+            log.exception("could not start the Antigravity CLI session")
 
 
 def preview(content, n=300):
@@ -93,6 +559,20 @@ class Agent:
         self.tools = {f.spec["function"]["name"]: f for f in tools}
         self.messages = []
         self.steps = 0
+        self.antigravity = AntigravitySession(model) if config.LLM_PROVIDER == "antigravity" else None
+
+    async def close(self):
+        if self.antigravity:
+            await self.antigravity.close()
+
+    async def warm(self):
+        if self.antigravity:
+            await self.antigravity.warm()
+
+    async def complete(self, messages):
+        if self.antigravity:
+            return await self.antigravity.chat(messages, [f.spec for f in self.tools.values()], self.on_text)
+        return await chat(messages, [f.spec for f in self.tools.values()], self.on_text, self.model)
 
     async def run(self, prompt):
         """One request: model, tools, model... until it answers without a tool. Returns its last words."""
@@ -100,8 +580,7 @@ class Agent:
         self.steps = 0
         for _ in range(config.MAX_STEPS):
             self.trim()
-            msg = await chat([{"role": "system", "content": self.system}] + self.messages,
-                             [f.spec for f in self.tools.values()], self.on_text, self.model)
+            msg = await self.complete([{"role": "system", "content": self.system}] + self.messages)
             if self.on_text:
                 self.on_text("\n")                  # end of a message: speak whatever is left
             if not msg.get("tool_calls"):
@@ -279,9 +758,17 @@ async def summarize(messages):
     if not talk:
         return
     events.emit("notes", status="updating")
-    msg = await chat([{"role": "system", "content": NOTES_PROMPT.format(name=config.USER_NAME)},
-                      {"role": "user", "content": "Current notes file:\n\n" + (read_notes() or NOTES_TEMPLATE.format(
-                          name=config.USER_NAME)) + "\n\nThe session that just ended:\n\n" + talk[-60000:]}])
+    prompt = [{"role": "system", "content": NOTES_PROMPT.format(name=config.USER_NAME)},
+              {"role": "user", "content": "Current notes file:\n\n" + (read_notes() or NOTES_TEMPLATE.format(
+                  name=config.USER_NAME)) + "\n\nThe session that just ended:\n\n" + talk[-60000:]}]
+    if config.LLM_PROVIDER == "antigravity":
+        provider = AntigravitySession(config.LLM_MODEL)
+        try:
+            msg = await provider.chat(prompt)
+        finally:
+            await provider.close()
+    else:
+        msg = await chat(prompt)
     notes = re.sub(r"(?s)<think>.*?</think>", "", msg["content"] or "").strip().strip("`").strip()
     if not notes.startswith("# Jarvis notes"):         # never overwrite the notes with something else
         raise RuntimeError(f"the model returned something that isn't the notes file: {notes[:120]!r}")
@@ -315,9 +802,15 @@ class Brain:
             system += ("\n# Your notes from earlier Jarvis sessions\n"
                        f"Each Jarvis session starts fresh. This is what earlier sessions left you ({config.NOTES_FILE}).\n\n"
                        + notes)
+        previous = self.agent
         self.agent = Agent(system, self.gate, list(pctools.TOOLS.values()), on_text=self._text)
+        if previous:
+            asyncio.create_task(previous.close())
+        if self.agent.antigravity:
+            asyncio.create_task(self.agent.warm())
         self.session_id, self.session_started, self.session_turns = uuid.uuid4().hex[:8], time.time(), 0
-        events.emit("brain", status="connected", model=config.LLM_MODEL, provider=config.LLM_BASE_URL)
+        provider = "Antigravity subscription" if config.LLM_PROVIDER == "antigravity" else config.LLM_BASE_URL
+        events.emit("brain", status="connected", model=config.LLM_MODEL, provider=provider)
         log.info("new session %s", self.session_id)
 
     def _text(self, delta):
@@ -339,6 +832,10 @@ class Brain:
     async def interrupt(self):
         if self.job and not self.job.done():
             self.job.cancel()
+
+    async def close(self):
+        if self.agent:
+            await self.agent.close()
 
     async def ask(self, prompt):
         t = time.time()
