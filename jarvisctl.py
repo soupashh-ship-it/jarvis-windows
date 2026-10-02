@@ -1,5 +1,6 @@
 """Talk to a running Jarvis without your voice.
 
+  python jarvisctl.py dashboard         open the dashboard in your browser
   python jarvisctl.py listen            same as saying "hey jarvis"
   python jarvisctl.py stop              shut up / cancel what you're doing
   python jarvisctl.py say open spotify  type a command instead of speaking it
@@ -10,35 +11,78 @@
 """
 import json
 import os
+import re
 import sys
+import urllib.error
 import urllib.request
 
 DIR = os.path.dirname(os.path.abspath(__file__))
 TOKEN_FILE = os.path.join(DIR, "logs", "ctl.token")
 
 
-def redact(text):
-    """API keys, tokens and passwords out: whole settings whose name says so, and anything shaped like a key."""
-    import re
+SECRET_NAME = r"\w*(?:key(?!s\b)|token|secret|password|passwd|pwd|auth)\w*"
+
+
+def redact(text, known=()):
+    """API keys, tokens and passwords out: whole settings whose name says so, "password": "..." style fields,
+    passwords in URLs, the known secret values themselves wherever they turn up, and anything shaped like a key."""
+    for value in sorted(known, key=len, reverse=True):
+        text = text.replace(value, "<redacted>")
     text = re.sub(r"(?im)^(\s*\w*(KEY|TOKEN|SECRET|PASSWORD|PASSWD|AUTH)\w*\s*=\s*).+$", r"\1'<redacted>'", text)
+    text = re.sub(rf"(?i)({SECRET_NAME}\\?[\"']?\s*[:=]\s*\\?[\"'])[^\"'\\\n]+", r"\1<redacted>", text)
+    text = re.sub(r"(?i)\b([a-z][\w+.-]*://)[^/\s:@'\"]+:[^/\s@'\"]+@", r"\1<redacted>@", text)
     text = re.sub(r"\b(sk-[\w-]{8,}|sk-ant-[\w-]{8,}|sk-or-[\w-]{8,}|gsk_\w{8,}|AIza[\w-]{20,}|xai-\w{8,}|"
                   r"hf_\w{8,}|gh[pousr]_\w{20,}|ya29\.[\w.-]{20,})", "<redacted>", text)
     return re.sub(r"(?i)(bearer\s+|api[_-]?key[\"'=:\s]+)[\w.-]{8,}", r"\1<redacted>", text)
 
 
 def desktop():
-    if os.name == "nt":                          # the real Desktop, even when OneDrive has moved it
-        import ctypes
-        buf = ctypes.create_unicode_buffer(260)
-        if ctypes.windll.shell32.SHGetFolderPathW(None, 0x10, None, 0, buf) == 0 and os.path.isdir(buf.value):
-            return buf.value
-    d = os.path.join(os.path.expanduser("~"), "Desktop")
+    import winapi
+    d = winapi.known_folder(0x10, os.path.join(os.path.expanduser("~"), "Desktop"))   # even when OneDrive moved it
     return d if os.path.isdir(d) else os.path.expanduser("~")
+
+
+def known_secrets():
+    """The values of every setting named like a secret (API keys, passwords), and the dashboard key."""
+    values = []
+    try:
+        import config
+        values = [v for k, v in vars(config).items() if re.search(r"KEY|TOKEN|SECRET|PASSWORD|PASSWD|AUTH", k)
+                  and not k.startswith("HOTKEY") and isinstance(v, str) and len(v) >= 6]
+    except Exception:
+        pass
+    try:
+        with open(TOKEN_FILE) as f:
+            values.append(f.read().strip())
+    except OSError:
+        pass
+    return [v for v in values if v]
+
+
+def private_events(text):
+    """events.jsonl without what Jarvis typed or wrote into files (passwords, messages): only that it did."""
+    out = []
+    for line in text.splitlines():
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            out.append(line)
+            continue
+        if ev.get("kind") == "tool_use" and ev.get("name") in ("type_text", "write_file"):
+            try:
+                args = json.loads(ev.get("input") or "{}")
+                args.update({k: "(left out of the report)" for k in ("text", "content") if k in args})
+                ev["input"] = json.dumps(args)
+            except ValueError:
+                ev["input"] = "(left out of the report)"
+        out.append(json.dumps(ev))
+    return "\n".join(out)
 
 
 def report():
     """jarvis-report-<date>.zip on the Desktop: logs, versions, packages, microphones and the config, secrets removed.
-    Nothing is uploaded anywhere; you send the file yourself. Screenshots, notes.md and the dashboard token stay out."""
+    Nothing is uploaded anywhere; you send the file yourself. Screenshots, notes.md, the dashboard token and anything
+    Jarvis typed or wrote into a file stay out."""
     import platform
     import subprocess
     import time
@@ -73,10 +117,13 @@ def report():
         if os.path.exists(os.path.join(DIR, name)):
             with open(os.path.join(DIR, name), encoding="utf-8", errors="replace") as f:
                 files[name] = f.read()
+    if "events.jsonl" in files:
+        files["events.jsonl"] = private_events(files["events.jsonl"])
+    known = known_secrets()
     out = os.path.join(desktop(), f"jarvis-report-{time.strftime('%Y-%m-%d-%H%M')}.zip")
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
         for name, text in files.items():
-            z.writestr(name, redact(text))
+            z.writestr(name, redact(text, known))
     print(f"Saved {out}\nDrag it into Discord (or attach it to a GitHub issue). Nothing was uploaded.")
     if os.name == "nt":
         subprocess.Popen(["explorer", "/select,", out])
@@ -95,9 +142,18 @@ if __name__ == "__main__":
     try:
         with open(TOKEN_FILE) as f:
             token = f.read().strip()
+    except OSError:
+        sys.exit("Jarvis hasn't been started yet (there is no logs\\ctl.token).")
+    if cmd == "dashboard":
+        import webbrowser
+        webbrowser.open(f"http://127.0.0.1:8765/?token={token}")
+        sys.exit()
+    try:
         req = urllib.request.Request("http://127.0.0.1:8765/api/cmd", json.dumps({"cmd": cmd, "text": rest}).encode(),
                                      {"Content-Type": "application/json", "X-Jarvis-Token": token})
         with urllib.request.urlopen(req, timeout=10) as r:
             print(json.load(r)["reply"])
+    except urllib.error.HTTPError as e:              # it is running, but said no
+        sys.exit(f"Jarvis refused that ({e.code}): {e.read().decode('utf-8', 'replace')[:300]}")
     except OSError:
         sys.exit("Jarvis isn't running.")

@@ -1,9 +1,13 @@
 """The dashboard web server: http://127.0.0.1:8765 (this PC only).
 
-GET  /                 the page
+Everything needs the token from logs/ctl.token: another Windows account on the same PC can reach 127.0.0.1 too.
+`python jarvisctl.py dashboard` opens /?token=..., which swaps it for a cookie; jarvisctl and the widget send it
+as an X-Jarvis-Token header. It survives restarts (delete logs/ctl.token to change it).
+
+GET  /?token=...       the page
 GET  /api/snapshot     everything about right now, plus recent history
 GET  /api/events       live stream (server-sent events)
-POST /api/cmd          listen / stop / say / yes / no (needs the token; jarvisctl.py reads it from logs/ctl.token)
+POST /api/cmd          listen / stop / say / yes / no
 """
 import asyncio
 import json
@@ -18,11 +22,26 @@ import events
 import pctools
 
 PORT = 8765
-TOKEN = secrets.token_urlsafe(24)
 SHOTS_DIR = os.path.join(config.JARVIS_DIR, "logs", "shots")
 PAGE = os.path.join(config.JARVIS_DIR, "dashboard.html")
 TOKEN_FILE = os.path.join(config.JARVIS_DIR, "logs", "ctl.token")
 ALLOWED_HOSTS = {f"127.0.0.1:{PORT}", f"localhost:{PORT}"}
+NO_TOKEN = ("Open the dashboard from the Jarvis folder with:  .venv\\Scripts\\python jarvisctl.py dashboard\n"
+            "(It needs the key in logs\\ctl.token, so other people on this PC can't use it.)")
+
+
+def _token():
+    try:
+        with open(TOKEN_FILE) as f:
+            old = f.read().strip()
+        if len(old) >= 32:
+            return old               # the same key across restarts, so an open dashboard keeps working
+    except OSError:
+        pass
+    return secrets.token_urlsafe(32)
+
+
+TOKEN = _token()
 
 
 # ---------- processes: Jarvis and what it started ----------
@@ -60,13 +79,21 @@ def processes():
 def _check(request):
     if request.host not in ALLOWED_HOSTS:
         raise web.HTTPForbidden(text="bad host")
+    key = request.headers.get("X-Jarvis-Token") or request.cookies.get("jarvis") or ""
+    if not secrets.compare_digest(key, TOKEN):
+        raise web.HTTPForbidden(text=NO_TOKEN)
 
 
 async def page(request):
+    if request.host in ALLOWED_HOSTS and secrets.compare_digest(request.query.get("token", ""), TOKEN):
+        resp = web.Response(status=302, headers={"Location": "/"})   # the key moves into a cookie, out of the address bar
+        resp.set_cookie("jarvis", TOKEN, httponly=True, samesite="Strict", max_age=400 * 86400)
+        return resp
     _check(request)
     with open(PAGE, encoding="utf-8") as f:
-        html = f.read().replace("__TOKEN__", TOKEN)
-    return web.Response(text=html, content_type="text/html", headers={"Cache-Control": "no-store"})
+        html = f.read()
+    return web.Response(text=html, content_type="text/html",
+                        headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"})
 
 
 async def snapshot(request):
@@ -84,7 +111,7 @@ async def stream(request):
     await resp.prepare(request)
     q = events.subscribe()
     try:
-        while True:
+        while events.subscribed(q):              # dropped for falling behind: end it, the page reconnects and reloads
             try:
                 ev = await asyncio.wait_for(q.get(), 15)
                 await resp.write(f"data: {json.dumps(ev, default=str)}\n\n".encode())
@@ -104,8 +131,6 @@ async def live(request):
 
 async def command(request):
     _check(request)
-    if request.headers.get("X-Jarvis-Token") != TOKEN:
-        raise web.HTTPForbidden(text="bad token")
     body = await request.json()
     reply = await request.app["jarvis"].command(body.get("cmd"), body.get("text", ""))
     return web.json_response({"reply": reply})
@@ -137,6 +162,7 @@ async def start(jarvis):
     os.makedirs(SHOTS_DIR, exist_ok=True)
     with open(TOKEN_FILE, "w") as f:
         f.write(TOKEN)
+    # ponytail: logs/ctl.token is only as private as the Jarvis folder; on a shared PC keep that folder in your user folder
     app = web.Application()
     app["jarvis"] = jarvis
     app.router.add_get("/", page)
