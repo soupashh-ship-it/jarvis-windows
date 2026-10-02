@@ -50,7 +50,10 @@ class INPUT(ctypes.Structure):
 
 
 def send(*inputs):
-    user32.SendInput(len(inputs), (INPUT * len(inputs))(*inputs), ctypes.sizeof(INPUT))
+    sent = user32.SendInput(len(inputs), (INPUT * len(inputs))(*inputs), ctypes.sizeof(INPUT))
+    if sent != len(inputs):          # e.g. the window in front runs as administrator, or the screen is locked
+        raise OSError(f"Windows blocked the input ({sent} of {len(inputs)} events went through); the window in "
+                      "front may be running as administrator, or the screen is locked")
 
 
 def key(vk, up=False):
@@ -69,10 +72,13 @@ def press(names):
     send(*[key(v) for v in vks], *[key(v, up=True) for v in reversed(vks)])
 
 
-def type_text(text):
-    """Type any text as Unicode key events, so the keyboard layout doesn't matter."""
+def type_text(text, stop=None):
+    """Type any text as Unicode key events, so the keyboard layout doesn't matter. Setting the threading.Event
+    stop ends it between characters (cancelling the coroutine that started this thread can't)."""
     units = memoryview(text.encode("utf-16-le")).cast("H")
     for u in units:
+        if stop and stop.is_set():
+            return
         send(INPUT(type=1, ki=KEYBDINPUT(wScan=u, dwFlags=4)), INPUT(type=1, ki=KEYBDINPUT(wScan=u, dwFlags=4 | 2)))
         time.sleep(0.004)
 
@@ -170,12 +176,24 @@ def focus(query):
     return {**hit, "minimized": False, "active": user32.GetForegroundWindow() == h}
 
 
+def known_folder(csidl, fallback):
+    """A shell folder's real path (0x05 Documents, 0x07 Startup, 0x10 Desktop), even when OneDrive has moved it."""
+    if os.name == "nt":
+        buf = ctypes.create_unicode_buffer(260)
+        if ctypes.windll.shell32.SHGetFolderPathW(None, csidl, None, 0, buf) == 0 and buf.value:
+            return buf.value
+    return fallback
+
+
 # ---------- global hotkeys ----------
 
 def parse_hotkey(combo):
     """'win+shift+j' -> (RegisterHotKey modifier flags, virtual key)."""
     names = [k.strip().lower() for k in combo.split("+") if k.strip()]
-    return sum(MODS[n] for n in names[:-1]), VK[names[-1]]
+    mods = 0
+    for n in names[:-1]:
+        mods |= MODS[n]                    # OR, so "ctrl+control+j" is still just Ctrl
+    return mods, VK[names[-1]]
 
 
 def listen_hotkeys(loop, actions):
@@ -184,7 +202,11 @@ def listen_hotkeys(loop, actions):
 
     def run():                     # hotkeys belong to the thread that registered them, which must pump messages
         for i, combo in enumerate(combos, 1):
-            mods, vk = parse_hotkey(combo)
+            try:
+                mods, vk = parse_hotkey(combo)
+            except (KeyError, IndexError):
+                log.warning("hotkey %r isn't a key combination I know (e.g. win+shift+j); skipped", combo)
+                continue
             if not user32.RegisterHotKey(None, i, mods | 0x4000, vk):           # 0x4000: no auto-repeat
                 log.warning("couldn't register hotkey %s (Windows or another app already uses it)", combo)
         msg = wintypes.MSG()

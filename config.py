@@ -70,5 +70,6 @@ WIDGET_MARGIN_Y = 30           # pixels from the top/bottom (the taskbar is alre
 # Your own settings go in config_local.py (gitignored), e.g. USER_NAME = "Pepper"
 try:
     from config_local import *  # noqa: F401,F403
-except ImportError:
-    pass
+except ModuleNotFoundError as e:
+    if e.name != "config_local":     # a broken import INSIDE config_local.py must show, not quietly drop your settings
+        raise

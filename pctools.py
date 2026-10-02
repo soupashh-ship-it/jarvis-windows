@@ -4,6 +4,7 @@ Every tool is an async function registered with @tool; brain.py hands their spec
 """
 import asyncio
 import base64
+import contextvars
 import io
 import json
 import os
@@ -13,6 +14,7 @@ import threading
 import time
 
 import mss
+import psutil
 from PIL import Image
 
 import config
@@ -23,6 +25,7 @@ TOOLS = {}                 # name -> async function, with .spec for the model
 TYPES = {str: "string", int: "integer", bool: "boolean"}
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)          # Jarvis runs windowless; so must its commands
 PS_UTF8 = "[Console]::OutputEncoding = [Text.Encoding]::UTF8; "
+DESKTOP = {"open_app", "focus_window", "click_at", "move_mouse", "scroll", "type_text", "press_keys"}  # one agent at a time
 
 
 def tool(name, description, params):
@@ -94,7 +97,8 @@ async def open_app(args):
     for q in [args["name"]] + (window_names(app) if app else []):
         w = winapi.focus(q)
         if w:
-            return text(f"{w['title']} was already open; brought it to the front.")
+            return text(f"{w['title']} was already open; brought it to the front." if w["active"] else
+                        f"{w['title']} is already open, but Windows wouldn't bring it to the front.")
     if not app:
         return text(f"No installed app matches '{args['name']}'. Try list_apps.")
     subprocess.Popen(["explorer.exe", "shell:AppsFolder\\" + app["id"]])
@@ -167,11 +171,16 @@ async def list_windows(args):
       "or app name, e.g. 'discord', 'outlook', 'Notepad'.", {"query": str})
 async def focus_window(args):
     w = winapi.focus(args["query"])
-    return text(f"Focused '{w['title']}' at {w['x']},{w['y']} {w['w']}x{w['h']}." if w
-                else f"No open window matches '{args['query']}'. Try list_windows.")
+    if not w:
+        return text(f"No open window matches '{args['query']}'. Try list_windows.")
+    if not w["active"]:
+        return text(f"Found '{w['title']}' but Windows wouldn't bring it to the front, so it does NOT have focus. "
+                    "Don't type yet: click on it in a screenshot, or ask the user to.")
+    return text(f"Focused '{w['title']}' at {w['x']},{w['y']} {w['w']}x{w['h']}.")
 
 
 LAST_SHOT = {"x": 0, "y": 0, "scale": 1.0}
+SHOT = contextvars.ContextVar("shot", default=LAST_SHOT)    # each agent sets its own (brain.Agent.run)
 
 
 @tool("screenshot", "Look at the screen. target: 'window' (the active window, sharpest), 'left' or 'right' "
@@ -194,7 +203,7 @@ async def screenshot(args):
     scale = max(1.0, img.width / 1920, img.height / 1080)
     if scale > 1:
         img = img.resize((round(img.width / scale), round(img.height / scale)))
-    LAST_SHOT.update(x=region["left"], y=region["top"], scale=scale)
+    SHOT.get().update(x=region["left"], y=region["top"], scale=scale)
     buf = io.BytesIO()
     img.save(buf, "JPEG", quality=80)
     save_shot(buf.getvalue(), label)
@@ -212,13 +221,14 @@ def save_shot(jpeg, label):
     name = time.strftime("%Y%m%d-%H%M%S") + f"-{int(time.time() * 1000) % 1000:03d}.jpg"
     with open(os.path.join(SHOTS_DIR, name), "wb") as f:
         f.write(jpeg)
-    events.emit("screenshot", file=name, what=label)
+    events.emit("screenshot", file=name, what=label, sub=SHOT.get().get("sub", False), agent=SHOT.get().get("agent"))
     for old in sorted(os.listdir(SHOTS_DIR))[:-300]:
         os.remove(os.path.join(SHOTS_DIR, old))
 
 
 def to_desktop(x, y):
-    return LAST_SHOT["x"] + x * LAST_SHOT["scale"], LAST_SHOT["y"] + y * LAST_SHOT["scale"]
+    shot = SHOT.get()
+    return shot["x"] + x * shot["scale"], shot["y"] + y * shot["scale"]
 
 
 @tool("click_at", "Click at a point in the most recent screenshot image (pixel coordinates in that image). "
@@ -250,7 +260,12 @@ async def scroll(args):
 @tool("type_text", "Type text into whatever window has focus, as if on the keyboard. Newlines are NOT allowed; "
       "use press_keys 'enter' separately.", {"text": str})
 async def type_text(args):
-    await asyncio.to_thread(winapi.type_text, args["text"].replace("\n", " "))
+    stop = threading.Event()
+    try:
+        await asyncio.to_thread(winapi.type_text, args["text"].replace("\n", " "), stop)
+    except asyncio.CancelledError:
+        stop.set()                           # the thread itself can't be cancelled; this ends it at the next character
+        raise
     return text("Typed.")
 
 
@@ -295,7 +310,7 @@ def shapes_to_desktop(shapes):
                 s[kx], s[ky] = to_desktop(float(s[kx]), float(s[ky]))
         for k in ("radius", "w", "h"):
             if k in s:
-                s[k] = float(s[k]) * LAST_SHOT["scale"]
+                s[k] = float(s[k]) * SHOT.get()["scale"]
         out.append(s)
     return out
 
@@ -342,6 +357,29 @@ async def clear_annotations(args):
 
 # ---------- commands and files ----------
 
+def kill_tree(proc):
+    """Stop a command and everything it started (Windows doesn't take the children down with their parent)."""
+    # ponytail: misses anything that detached and re-parented before this ran; upgrade path is a Windows Job Object
+    try:
+        kids = psutil.Process(proc.pid).children(recursive=True)
+    except psutil.Error:
+        kids = []
+    for p in kids + [proc]:
+        try:
+            p.kill()
+        except (psutil.Error, ProcessLookupError):
+            pass
+
+
+async def read_tail(stream, keep=32000):
+    """Everything the command prints, keeping only the last `keep` bytes in memory."""
+    buf = bytearray()
+    while chunk := await stream.read(65536):
+        buf += chunk
+        del buf[:-keep]
+    return bytes(buf)
+
+
 @tool("run_command", "Run a PowerShell command on this PC and get its output (last 8000 characters). For files and "
       "folders, system info, web requests (Invoke-RestMethod, curl.exe) and anything without its own tool. "
       "description: a few plain words on what it does (read out if the user is asked to approve it). "
@@ -351,9 +389,14 @@ async def run_command(args):
     proc = await asyncio.create_subprocess_exec(*shell, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
                                                 stdin=asyncio.subprocess.DEVNULL, cwd=config.HOME, creationflags=NO_WINDOW)
     try:
-        out, _ = await asyncio.wait_for(proc.communicate(), max(1, min(600, args.get("timeout") or 60)))
+        out = await asyncio.wait_for(read_tail(proc.stdout), max(1, min(600, args.get("timeout") or 60)))
+        await proc.wait()
     except (asyncio.TimeoutError, asyncio.CancelledError) as e:
-        proc.kill()
+        kill_tree(proc)
+        try:
+            await asyncio.wait_for(proc.wait(), 5)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            pass
         if isinstance(e, asyncio.CancelledError):
             raise
         return text("Timed out and stopped. For long jobs, start a worker.")

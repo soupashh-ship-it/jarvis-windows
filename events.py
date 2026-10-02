@@ -14,6 +14,7 @@ KEEP = 3000
 LIVE_ONLY = {"meter", "procs", "delta", "partial", "speaking_now"}   # too chatty to store
 
 _ids = itertools.count(1)
+_writes = itertools.count(1)
 history = collections.deque(maxlen=KEEP)
 _subscribers = {}                               # queue -> tag
 _listeners = []                                 # plain functions called with every event
@@ -43,8 +44,15 @@ def emit(kind, **data):
     ev = {"id": next(_ids), "ts": time.time(), "kind": kind, **data}
     if kind not in LIVE_ONLY:
         history.append(ev)
-        with open(EVENTS_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(ev, default=str) + "\n")
+        try:                                    # a full or locked disk must never stop Jarvis (or the Stop button)
+            if next(_writes) % KEEP == 0:       # keep the file to the last KEEP events while running, too
+                with open(EVENTS_FILE, "w", encoding="utf-8") as f:
+                    f.writelines(json.dumps(e, default=str) + "\n" for e in history)
+            else:
+                with open(EVENTS_FILE, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(ev, default=str) + "\n")
+        except OSError:
+            pass
     for fn in _listeners:
         try:
             fn(ev)
@@ -70,6 +78,10 @@ def subscribe(tag="dashboard"):
 
 def unsubscribe(q):
     _subscribers.pop(q, None)
+
+
+def subscribed(q):
+    return q in _subscribers
 
 
 def watchers(tag="dashboard"):

@@ -72,7 +72,8 @@ class SentenceSplitter:
 
     def flush(self):
         rest, self.buf = self.buf, ""
-        return [] if self.in_code else self._sentences(rest, final=True)
+        in_code, self.in_code = self.in_code, False       # an unclosed ``` or <think> doesn't mute the next reply
+        return [] if in_code else self._sentences(rest, final=True)
 
     @staticmethod
     def _sentences(text, final):

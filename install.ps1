@@ -17,25 +17,34 @@ if ($LASTEXITCODE) { throw "pip install failed, see above." }
 New-Item -ItemType Directory -Force models, logs | Out-Null
 $kokoro = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0"
 foreach ($f in "kokoro-v1.0.onnx", "voices-v1.0.bin") {
-    if (-not (Test-Path "models\$f")) { Write-Host "Downloading $f..."; Invoke-WebRequest "$kokoro/$f" -OutFile "models\$f" }
+    # a file of the wrong size (an earlier download cut short) is fetched again; a new one lands as .part first
+    $size = 0
+    try { $size = [long]"$((Invoke-WebRequest "$kokoro/$f" -Method Head -UseBasicParsing).Headers['Content-Length'])" } catch { }
+    if (-not (Test-Path "models\$f") -or ($size -gt 0 -and (Get-Item "models\$f").Length -ne $size)) {
+        Write-Host "Downloading $f..."
+        Invoke-WebRequest "$kokoro/$f" -OutFile "models\$f.part"
+        Move-Item -Force "models\$f.part" "models\$f"
+    }
 }
 .\.venv\Scripts\python.exe -c "import openwakeword.utils as u; u.download_models(['hey_jarvis'])"
 if ($LASTEXITCODE) { throw "Wake word model download failed." }
 
-# 3. Start Jarvis and its widget at every logon: a Task Scheduler task for this user (no admin needed)
+# 3. Start Jarvis and its widget at every logon: a Task Scheduler task each for this user (no admin needed).
+#    Two tasks, not one task with two actions: a task runs its actions one after another, and Jarvis never ends.
 $py = Join-Path $PSScriptRoot ".venv\Scripts\pythonw.exe"
 $me = "$env:USERDOMAIN\$env:USERNAME"
-$actions = @(
-    (New-ScheduledTaskAction -Execute $py -Argument "`"$PSScriptRoot\jarvis.py`"" -WorkingDirectory $PSScriptRoot),
-    (New-ScheduledTaskAction -Execute $py -Argument "`"$PSScriptRoot\widget.py`"" -WorkingDirectory $PSScriptRoot))
 $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 `
     -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew
-Register-ScheduledTask -TaskName "Jarvis" -Action $actions -Trigger (New-ScheduledTaskTrigger -AtLogOn -User $me) `
-    -Settings $settings -Principal (New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Limited) -Force | Out-Null
-Stop-ScheduledTask -TaskName "Jarvis" -ErrorAction SilentlyContinue
-Start-ScheduledTask -TaskName "Jarvis"
+$tasks = [ordered]@{ "Jarvis" = "jarvis.py"; "Jarvis Widget" = "widget.py" }
+foreach ($name in $tasks.Keys) {
+    $action = New-ScheduledTaskAction -Execute $py -Argument "`"$PSScriptRoot\$($tasks[$name])`"" -WorkingDirectory $PSScriptRoot
+    Register-ScheduledTask -TaskName $name -Action $action -Trigger (New-ScheduledTaskTrigger -AtLogOn -User $me) `
+        -Settings $settings -Principal (New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Limited) -Force | Out-Null
+    Stop-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+    Start-ScheduledTask -TaskName $name
+}
 
 Write-Host ""
 Write-Host "Jarvis is installed and starting (the first start downloads whisper, give it a minute)."
-Write-Host "Dashboard: http://127.0.0.1:8765    Log: $PSScriptRoot\logs\jarvis.log"
+Write-Host "Dashboard: .venv\Scripts\python jarvisctl.py dashboard    Log: $PSScriptRoot\logs\jarvis.log"
 Write-Host "Make sure your model is set in config_local.py (see README) or Ollama is running."

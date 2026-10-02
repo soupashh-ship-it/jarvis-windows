@@ -71,11 +71,11 @@ class Shape:
         tw = tf.horizontalAdvance(self.title)
         dw = df.horizontalAdvance(self.detail) if self.detail else 0
         lead = 2 * BADGE_R + 8 if self.step else 0
-        w = 28 + lead + max(tw, dw)
-        h = 18 + tf.height() + (df.height() + 1 if self.detail else 0)
-        box = QRectF(0, 0, w, max(h, 2 * BADGE_R + 18))
         scr = QApplication.screenAt(anchor.center().toPoint()) or QApplication.primaryScreen()
         g = QRectF(scr.geometry()).adjusted(12, 12, -12, -12)              # stay on the shape's monitor
+        w = min(g.width(), 28 + lead + max(tw, dw))                         # a too-long label is cut short, not off-screen
+        h = 18 + tf.height() + (df.height() + 1 if self.detail else 0)
+        box = QRectF(0, 0, w, max(h, 2 * BADGE_R + 18))
         if below is None:                                                  # centred on an arrow's tail
             box.moveCenter(anchor.center())
         else:
@@ -191,12 +191,14 @@ class Shape:
         y = box.center().y() - text_h / 2
         p.setFont(fonts[0])
         p.setPen(d.LABEL)
-        p.drawText(QRectF(x, y, box.right() - x, tf.height()), Qt.AlignLeft | Qt.AlignVCenter, self.title)
+        room = box.right() - 14 - x
+        p.drawText(QRectF(x, y, box.right() - x, tf.height()), Qt.AlignLeft | Qt.AlignVCenter,
+                   tf.elidedText(self.title, Qt.ElideRight, room))
         if self.detail:
             p.setFont(fonts[1])
             p.setPen(d.SECONDARY)
             p.drawText(QRectF(x, y + tf.height() + 1, box.right() - x, df.height()), Qt.AlignLeft | Qt.AlignVCenter,
-                       self.detail)
+                       df.elidedText(self.detail, Qt.ElideRight, room))
         p.restore()
 
     def paint_badge(self, p, at, scale, shadow=False):

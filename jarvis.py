@@ -30,15 +30,13 @@ import dashboard
 import events
 import winapi
 import worker
-from brain import Brain, read_notes, read_state, summarize, write_state
+from brain import Brain, approved, read_notes, read_state, summarize, write_state
 from ears import Ears
 from mouth import Mouth
 
 IDLE, LISTEN, BUSY = "idle", "listening", "busy"
-YES = re.compile(r"\b(yes|yeah|yep|yup|sure|go ahead|do it|confirm(ed)?|affirmative|ok|okay|please do|proceed|send it)\b", re.I)
 NEW_SESSION = re.compile(r"^\W*(please\W+)?(start\W+)?(a\W+)?(new|fresh)\W+(session|chat|conversation|start)\W*(please)?\W*$"
                          r"|^\W*fresh start\W*$", re.I)
-NO = re.compile(r"\b(no|nope|don'?t|stop|cancel|wait|hold on|never ?mind)\b", re.I)
 
 
 def time_tag():
@@ -107,7 +105,7 @@ class Jarvis:
         self.talk_frames = collections.deque(maxlen=15)
         self.talk_run = 0
         self.partial_busy = False
-        self.mouth.on_sentence_start = lambda text: events.emit("speaking_now", text=text)
+        self.mouth.on_sentence_start = self.sentence_started
         self.live = {"you": "", "said": "", "step": "", "self_started": False}
         events.listen(self.track_live)
 
@@ -135,7 +133,7 @@ class Jarvis:
                     model=config.LLM_MODEL, dashboard=f"http://127.0.0.1:{dashboard.PORT}")
         self.mouth.chime("wake")
         self.mouth.say(f"Online and ready, {config.HONORIFIC}.")
-        log.info("ready, dashboard on http://127.0.0.1:%d", dashboard.PORT)
+        log.info("ready; open the dashboard with: python jarvisctl.py dashboard")
         await asyncio.gather(self.audio_loop(), self.inbox_loop(), self.idle_watch())
 
     # ---------- sessions and notes ----------
@@ -206,10 +204,11 @@ class Jarvis:
             if self.zero_blocks == 63:                 # 5 s of digital silence
                 self.mic_silent()
             if self.state != LISTEN:
-                if self.ears.heard_wake_word(chunk):
+                woke = self.ears.heard_wake_word(chunk)
+                self.wake_score = self.ears.last_score      # before wake(), so its event has this frame's score
+                if woke:
                     await self.wake()
                     continue
-                self.wake_score = self.ears.last_score
                 if config.BARGE_IN_BY_VOICE and self.mouth.busy:
                     await self.check_talk_over(chunk)
                 else:
@@ -219,6 +218,7 @@ class Jarvis:
             result = self.recorder.feed(chunk)
             if result is None:
                 if self.recorder.speaking and not self.partial_busy and len(self.recorder.frames) % 8 == 0:
+                    self.partial_busy = True     # claimed here: a backlog of queued audio runs through without yielding
                     self.loop.create_task(self.live_partial(self.listen_id, list(self.recorder.frames)))
                 continue
             target, self.listen_target = self.listen_target, None
@@ -231,7 +231,7 @@ class Jarvis:
                     target.set_result("")
                 continue
             self.state = BUSY
-            self.loop.create_task(self.handle_audio(result, target))
+            self.loop.create_task(self.handle_audio(result, target, self.listen_id))
 
     def mic_silent(self):
         msg = (f"The microphone ({self.ears.mic_name}) is sending pure silence: Windows is blocking it or it is muted. "
@@ -244,7 +244,6 @@ class Jarvis:
                            "Windows may be blocking it; the log has the details.")
 
     async def live_partial(self, listen_id, frames):
-        self.partial_busy = True
         try:
             text = await self.ears.partial(np.concatenate(frames))
             if text and listen_id == self.listen_id and self.state == LISTEN:
@@ -273,9 +272,21 @@ class Jarvis:
             await self.brain.interrupt()
         self.begin_listen(None, config.WAIT_FOR_SPEECH_S, prefix)
 
-    async def handle_audio(self, audio, target):
+    async def handle_audio(self, audio, target, listen_id):
         t = time.time()
-        text = await self.ears.transcribe(audio)
+        try:
+            text = await self.ears.transcribe(audio)
+        except Exception as e:
+            log.exception("speech to text failed")
+            events.emit("error", where="speech to text", error=str(e))
+            text = ""
+        if listen_id != self.listen_id:          # Stop, or a new "hey jarvis", came while this was transcribing
+            log.info("dropped what was heard before that: %s", text or "(nothing)")
+            if target and not target.done():
+                target.set_result("")
+            if self.state == BUSY and not self.processing:
+                self.state = IDLE
+            return
         log.info("heard: %s", text or "(nothing)")
         events.emit("heard", text=text, confirm=bool(target), listen_id=self.listen_id, seconds=round(len(audio) / 16000, 1),
                     stt_s=round(time.time() - t, 2))
@@ -325,11 +336,15 @@ class Jarvis:
 
     def speak(self, sentence):
         print(f"Jarvis: {sentence}", flush=True)
+        events.emit("say", text=sentence)
+        self.mouth.say(sentence)
+
+    def sentence_started(self, text):
+        """A sentence has started playing: first_speech is when you actually hear him, not when the text arrived."""
+        events.emit("speaking_now", text=text)
         if self.turn and self.turn["first_speech"] is None:
             self.turn["first_speech"] = time.time()
             events.emit("first_speech", after_s=round(time.time() - self.turn["started"], 2))
-        events.emit("say", text=sentence)
-        self.mouth.say(sentence)
 
     async def confirm(self, question):
         async with self.confirm_lock:
@@ -338,23 +353,29 @@ class Jarvis:
     async def _confirm(self, question):
         await self.mouth.wait_done()
         # the future exists before he hears the question, so a "yes" said over it still counts
-        self.pending_confirm = self.loop.create_future()
+        fut = self.pending_confirm = self.loop.create_future()
         self.pending_question = question
-        self.speak(question)
-        events.emit("confirm_ask", question=question)
-        await self.mouth.wait_done()
-        already = self.state == LISTEN and self.listen_target is self.pending_confirm
-        if not self.pending_confirm.done() and not already:
-            self.mouth.chime("wake")
-            self.begin_listen(self.pending_confirm, config.CONFIRM_WAIT_S)
+        answer = ""
         try:
-            answer = await asyncio.wait_for(self.pending_confirm, config.CONFIRM_WAIT_S + 30)
-        except asyncio.TimeoutError:
-            answer = ""
-        self.pending_confirm = self.pending_question = None
-        if self.state == BUSY and not self.processing:
-            self.state = IDLE                 # the question came from a background job
-        ok = bool(YES.search(answer)) and not NO.search(answer)
+            self.speak(question)
+            events.emit("confirm_ask", question=question)
+            await self.mouth.wait_done()
+            already = self.state == LISTEN and self.listen_target is fut
+            if not fut.done() and not already:
+                self.mouth.chime("wake")
+                self.begin_listen(fut, config.CONFIRM_WAIT_S)
+            try:
+                answer = await asyncio.wait_for(fut, config.CONFIRM_WAIT_S + 30)
+            except asyncio.TimeoutError:
+                pass
+        finally:                              # also when Stop cancels the request mid-question: no ghost question
+            if self.pending_confirm is fut:
+                self.pending_confirm = self.pending_question = None
+            if self.state == LISTEN and self.listen_target is fut:
+                self.listen_target, self.state = None, BUSY if self.processing else IDLE
+            elif self.state == BUSY and not self.processing:
+                self.state = IDLE             # the question came from a background job
+        ok = approved(answer)
         log.info("confirm %r -> %s", answer, ok)
         events.emit("confirm_answer", question=question, answer=answer, approved=ok)
         return ok
@@ -369,14 +390,15 @@ class Jarvis:
         elif cmd == "listen":
             await self.wake(how="button")
         elif cmd == "stop":
-            events.emit("stopped_by_user")
             self.mouth.stop()
+            self.listen_id += 1                   # anything still being transcribed is dropped too
             if self.pending_confirm and not self.pending_confirm.done():
                 self.pending_confirm.set_result("no")
             if self.processing:
                 await self.brain.interrupt()
-            if self.state == LISTEN and not self.listen_target:
-                self.state = BUSY if self.processing else IDLE
+            if self.state == LISTEN:
+                self.listen_target, self.state = None, BUSY if self.processing else IDLE
+            events.emit("stopped_by_user")
         elif cmd in ("yes", "no"):
             if not (self.pending_confirm and not self.pending_confirm.done()):
                 return "nothing is waiting for a yes/no"
@@ -475,8 +497,9 @@ async def main():
             signal.signal(sig, lambda *_: loop.call_soon_threadsafe(stop.set))
     task = asyncio.create_task(jarvis.run())
     await asyncio.wait([task, asyncio.create_task(stop.wait())], return_when=asyncio.FIRST_COMPLETED)
-    if task.done() and task.exception():
-        log.error("crashed", exc_info=task.exception())
+    crashed = task.done() and not task.cancelled() and task.exception()
+    if crashed:
+        log.error("crashed", exc_info=crashed)
     events.emit("stopping")
     task.cancel()
     jarvis.ears.stream.close()
@@ -484,7 +507,8 @@ async def main():
     await jarvis.brain.interrupt()
     await worker.stop_all()
     await jarvis.save_notes()
+    return bool(crashed)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    sys.exit(1 if asyncio.run(main()) else 0)     # a crash exits non-zero, so Task Scheduler sees a failure

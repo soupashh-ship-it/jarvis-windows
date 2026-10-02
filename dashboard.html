@@ -47,7 +47,6 @@ header { display: grid; grid-template-columns: auto 1fr auto; gap: 24px; align-i
 #meter-wrap { align-self: center; max-width: 420px; }
 #meter { height: 8px; background: var(--rule); position: relative; }
 #meter-fill { height: 100%; width: 0; background: var(--meter); }
-#meter-thresh { position: absolute; top: -4px; bottom: -4px; width: 2px; background: var(--bad); }
 #meter-label { font-size: 12px; color: var(--muted); margin-top: 4px; }
 
 .cols { display: grid; grid-template-columns: minmax(0, 2fr) minmax(300px, 1fr); gap: 40px; }
@@ -72,6 +71,8 @@ table { width: 100%; border-collapse: collapse; }
 th { text-align: left; font-weight: 600; color: var(--muted); font-size: 13px; border-bottom: 1px solid var(--rule-strong); padding: 4px 8px 4px 0; }
 td { border-bottom: 1px solid var(--rule); padding: 7px 8px 7px 0; vertical-align: top; }
 tr.turn { cursor: pointer; }
+button.expand { all: unset; cursor: pointer; }
+button.expand:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
 tr.turn:hover td { background: var(--row); }
 tr.open td { background: var(--row); }
 tr.detail td { background: var(--row); padding: 4px 12px 16px; }
@@ -113,10 +114,10 @@ ul.plain li { border-bottom: 1px solid var(--rule); padding: 6px 0; font-size: 1
 <header>
   <div>
     <h1>Jarvis</h1>
-    <div id="conn" class="muted">Connecting...</div>
+    <div id="conn" class="muted" role="status">Connecting...</div>
   </div>
   <div id="meter-wrap">
-    <div id="meter" title="Microphone level"><div id="meter-fill"></div><div id="meter-thresh"></div></div>
+    <div id="meter" title="Microphone level"><div id="meter-fill"></div></div>
     <div id="meter-label">Microphone</div>
   </div>
   <div>
@@ -129,6 +130,7 @@ ul.plain li { border-bottom: 1px solid var(--rule); padding: 6px 0; font-size: 1
 <main>
   <section>
     <h2>Now</h2>
+    <div id="ask" role="alert"></div>
     <div id="now"></div>
   </section>
 
@@ -141,7 +143,7 @@ ul.plain li { border-bottom: 1px solid var(--rule); padding: 6px 0; font-size: 1
       <button type="button" class="plain" data-cmd="stop">Stop</button>
       <button type="button" class="plain" data-cmd="new" title="Update his notes, then start a clean conversation">New session</button>
     </form>
-    <div id="cmd-reply"></div>
+    <div id="cmd-reply" role="status"></div>
   </section>
 
   <section>
@@ -169,6 +171,7 @@ ul.plain li { border-bottom: 1px solid var(--rule); padding: 6px 0; font-size: 1
   <section>
     <h2>Today</h2>
     <dl class="facts" id="today"></dl>
+    <p class="muted" id="today-note" hidden>Counted from the most recent 1500 events only.</p>
   </section>
   <section>
     <h2>Session</h2>
@@ -192,10 +195,9 @@ ul.plain li { border-bottom: 1px solid var(--rule); padding: 6px 0; font-size: 1
 </div>
 
 <script>
-const TOKEN = "__TOKEN__";
 const $ = id => document.getElementById(id);
 let snap = null, history = [], procs = [], meter = {level: 0, wake: 0, activity: "idle"};
-let openTurns = new Set(), historyLimit = 40, dirty = false, connected = false;
+let openTurns = new Set(), historyLimit = 40, dirty = false, connected = false, snapSeq = 0, shownAsk = null;
 
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
 const clock = ts => new Date(ts * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
@@ -234,10 +236,28 @@ function toolDetail(ev) {
 
 // ---------- turns from the event log ----------
 function buildTurns() {
-  const turns = []; let cur = null; const byTool = {};
+  const turns = []; let cur = null; const byTool = {}, workers = {};
   for (const ev of history) {
     if (ev.kind === "session_reset") {
       turns.push({reset: ev, start: ev});
+      continue;
+    }
+    if (ev.kind === "worker") {            // each worker job is its own row, whatever Jarvis is doing meanwhile
+      let w = workers[ev.name];
+      if (ev.state === "running" && !w) {
+        w = workers[ev.name] = {start: ev, text: `The ${ev.name} worker`, source: "background", said: [], steps: [], shots: [], asks: [], end: null, first: null};
+        turns.push(w);
+      } else if (w && ["done", "failed", "stopped"].includes(ev.state) || (w && ev.state === "waiting" && !ev.asking)) {
+        if (ev.text) w.said.push(ev.text);
+        w.end = {ts: ev.ts, duration_s: ev.ts - w.start.ts, error: ev.state === "failed"};
+        delete workers[ev.name];
+      }
+      continue;
+    }
+    if (ev.sub && (ev.kind === "tool_use" || ev.kind === "screenshot")) {
+      const w = workers[ev.agent];
+      if (w && ev.kind === "tool_use") { const step = {ev, result: null}; w.steps.push(step); byTool[ev.tool_id] = step; }
+      else if (w) w.shots.push(ev);
       continue;
     }
     if (ev.kind === "turn_start") {
@@ -275,20 +295,24 @@ function renderStatus() {
   if (snap) $("status-sub").textContent = `Up for ${dur(Date.now() / 1000 - snap.started)}`;
   $("meter-fill").style.width = Math.round((meter.level || 0) * 100) + "%";
   const th = snap ? snap.config.wake_threshold : 0.5;
-  $("meter-thresh").style.left = "calc(" + (th * 100) + "% - 1px)";
   $("meter-label").textContent = `Microphone level. Wake word score ${Number(meter.wake || 0).toFixed(2)} (wakes at ${th})`;
 }
 
+function renderAsk() {                  // only redrawn when the question changes, so a focused Yes/No button keeps focus
+  const q = (snap && snap.question) || "";
+  if (q === shownAsk) return;
+  shownAsk = q;
+  $("ask").innerHTML = q ? `<div class="slip"><p>${esc(q)}</p>
+      <button type="button" data-cmd="yes">Yes</button> <button type="button" class="plain" data-cmd="no">No</button></div>` : "";
+}
+
 function renderNow(turns) {
+  renderAsk();
   const el = $("now");
-  const real = turns.filter(t => !t.reset);
+  const real = turns.filter(t => !t.reset && t.source !== "background");
   const last = real[real.length - 1];
   const active = last && !last.end ? last : null;
   let html = "";
-  if (snap && snap.question) {
-    html += `<div class="slip"><p>${esc(snap.question)}</p>
-      <button type="button" data-cmd="yes">Yes</button> <button type="button" class="plain" data-cmd="no">No</button></div>`;
-  }
   if (active) {
     const step = active.steps[active.steps.length - 1];
     const lastShot = active.shots[active.shots.length - 1];
@@ -308,7 +332,7 @@ function renderNow(turns) {
   el.innerHTML = html;
 }
 
-function sourceWord(s) { return {voice: "Voice", typed: "Typed", worker: "Worker update"}[s] || s; }
+function sourceWord(s) { return {voice: "Voice", typed: "Typed", worker: "Worker update", background: "Background worker"}[s] || s; }
 
 function renderWaiting() {
   const rows = [];
@@ -330,17 +354,17 @@ function renderWaiting() {
 }
 
 function renderHistory(turns) {
-  const real = turns.filter(t => !t.reset), lastReal = real[real.length - 1];
+  const real = turns.filter(t => !t.reset && t.source !== "background"), lastReal = real[real.length - 1];
   const done = turns.filter(t => t.reset || t.end || t !== lastReal).reverse();
   const shown = done.slice(0, historyLimit);
   $("more").hidden = done.length <= historyLimit;
   $("history").innerHTML = shown.map(t => {
     if (t.reset) return `<tr><td class="when num">${clock(t.reset.ts)}</td><td colspan="4" class="muted">New session started (${t.reset.reason === "idle" ? "after being idle" : "you asked"}). Notes updated first.</td></tr>`;
     const key = t.start.id, open = openTurns.has(key);
-    const took = t.end ? dur(t.end.duration_s) : "stopped";
+    const took = t.end ? dur(t.end.duration_s) : t.source === "background" ? "running" : "stopped";
     const reply = t.said.join(" ");
     let row = `<tr class="turn${open ? " open" : ""}" data-turn="${key}">
-      <td class="when num">${clock(t.start.ts)}${isToday(t.start.ts) ? "" : `<span class="src">${new Date(t.start.ts * 1000).toLocaleDateString()}</span>`}</td>
+      <td class="when num"><button type="button" class="expand" aria-expanded="${open}" title="Show every step">${clock(t.start.ts)}</button>${isToday(t.start.ts) ? "" : `<span class="src">${new Date(t.start.ts * 1000).toLocaleDateString()}</span>`}</td>
       <td class="req">${esc(t.text) || '<span class="muted">(a worker reported back)</span>'}<span class="src">${sourceWord(t.source)}</span></td>
       <td>${esc(reply.length > 220 && !open ? reply.slice(0, 220) + "..." : reply) || '<span class="muted">(nothing)</span>'}${t.end && t.end.error ? ' <span class="bad">Ended with an error</span>' : ""}</td>
       <td class="num hide-narrow">${t.steps.length}</td><td class="num hide-narrow">${took}</td></tr>`;
@@ -365,12 +389,13 @@ function turnDetail(t) {
     }).join("") + "</ol>";
   }
   if (t.shots.length) h += "<div class='shots'>" + t.shots.map(s =>
-    `<figure><a href="/shots/${esc(s.file)}" target="_blank"><img loading="lazy" src="/shots/${esc(s.file)}" alt=""></a><figcaption>${clock(s.ts)}, ${esc(s.what)}</figcaption></figure>`).join("") + "</div>";
+    `<figure><a href="/shots/${esc(s.file)}" target="_blank"><img loading="lazy" src="/shots/${esc(s.file)}" alt="Screenshot of ${esc(s.what)} at ${clock(s.ts)} (opens full size)"></a><figcaption>${clock(s.ts)}, ${esc(s.what)}</figcaption></figure>`).join("") + "</div>";
   return h;
 }
 
 function renderToday(turns) {
-  const today = turns.filter(t => !t.reset && isToday(t.start.ts));
+  const today = turns.filter(t => !t.reset && t.source !== "background" && isToday(t.start.ts));
+  $("today-note").hidden = !(history.length >= 1500 && isToday(history[0].ts));
   const ended = today.filter(t => t.end);
   const firsts = today.filter(t => t.first != null).map(t => t.first);
   const avg = a => a.length ? (a.reduce((x, y) => x + y, 0) / a.length) : null;
@@ -463,8 +488,12 @@ function schedule() { if (!dirty) { dirty = true; requestAnimationFrame(render);
 
 // ---------- data ----------
 async function loadSnapshot() {
+  const seq = ++snapSeq;
   const r = await fetch("/api/snapshot", {cache: "no-store"});
-  snap = await r.json();
+  if (r.status === 403) { $("conn").textContent = await r.text(); return; }
+  const s = await r.json();
+  if (seq !== snapSeq) return;             // a newer request went out meanwhile: this answer is already stale
+  snap = s;
   history = snap.history; procs = snap.procs; meter.activity = snap.activity;
   schedule();
 }
@@ -486,20 +515,22 @@ function connect() {
   };
 }
 
-async function send(cmd, text) {
+async function send(cmd, text) {           // true once Jarvis has it
   $("cmd-reply").textContent = "";
+  let r;
   try {
-    const r = await fetch("/api/cmd", {method: "POST", headers: {"Content-Type": "application/json", "X-Jarvis-Token": TOKEN},
-      body: JSON.stringify({cmd, text})});
-    const j = await r.json();
-    $("cmd-reply").textContent = j.reply === "ok" ? "" : j.reply;
-  } catch (e) { $("cmd-reply").textContent = "Couldn't reach Jarvis."; }
+    r = await fetch("/api/cmd", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({cmd, text})});
+  } catch (e) { $("cmd-reply").textContent = "Couldn't reach Jarvis. Is it running?"; return false; }
+  if (!r.ok) { $("cmd-reply").textContent = `Jarvis refused that (${r.status}): ${await r.text()}`; return false; }
+  const j = await r.json();
+  $("cmd-reply").textContent = j.reply === "ok" ? "" : j.reply;
+  return true;
 }
 
-$("cmd-form").addEventListener("submit", e => {
+$("cmd-form").addEventListener("submit", async e => {
   e.preventDefault();
-  const t = $("cmd-text").value.trim();
-  if (t) { send("say", t); $("cmd-text").value = ""; }
+  const box = $("cmd-text"), t = box.value.trim();
+  if (t && await send("say", t) && box.value.trim() === t) box.value = "";   // a failed send keeps the draft
 });
 document.addEventListener("click", e => {
   const b = e.target.closest("[data-cmd]");

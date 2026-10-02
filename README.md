@@ -36,21 +36,23 @@ powershell -ExecutionPolicy Bypass -File install.ps1
 
 1. creates `.venv` with Python 3.12 and installs `requirements.txt`,
 2. downloads the Kokoro voice into `models\` and the "Hey Jarvis" wake word model,
-3. registers a Task Scheduler task called **Jarvis** for your user (no admin needed) that starts Jarvis and its widget at every logon, windowless, and restarts them if they crash,
-4. starts it.
+3. registers two Task Scheduler tasks for your user, **Jarvis** and **Jarvis Widget** (no admin needed), that start Jarvis and its widget at every logon, windowless,
+4. starts them.
 
 The whisper models download by themselves on the first start, so the first start takes a minute or two.
 
 ## Update
 
-No reinstall needed; your `config_local.py`, `notes.md` and logs are kept. In PowerShell, in the repo folder:
+No reinstall needed; your `config_local.py`, `notes.md` and logs are kept. In PowerShell, in the repo folder, in this order:
 
 ```
+"Jarvis", "Jarvis Widget" | % { Stop-ScheduledTask $_ }
 git pull
-Stop-ScheduledTask Jarvis; Start-ScheduledTask Jarvis
+.venv\Scripts\python -m pip install -r requirements.txt
+"Jarvis", "Jarvis Widget" | % { Start-ScheduledTask $_ }
 ```
 
-Only if `git pull` listed `requirements.txt` among the changed files, run `.venv\Scripts\python -m pip install -r requirements.txt` (or `install.ps1` again, which is safe to repeat) before restarting. If `git pull` refuses because you edited `config.py` itself, run `git stash`, `git pull`, then put your settings in `config_local.py` instead (`git stash show -p` shows what you had changed).
+The pip line is quick when nothing changed, so always run it. Running `install.ps1` again instead does the same and is safe to repeat. If `git pull` refuses because you edited `config.py` itself, run `git stash`, `git pull`, then put your settings in `config_local.py` instead (`git stash show -p` shows what you had changed).
 
 ### Microphone
 
@@ -59,7 +61,7 @@ Only if `git pull` listed `requirements.txt` among the changed files, run `.venv
 - To pick another mic, set `MIC_DEVICE = "Yeti"` (part of its name) in `config_local.py`. Windows lists each mic several times, once per audio system (MME, DirectSound, WASAPI, WDM-KS); a name picks the MME one. A number picks exactly that entry: every input is listed with its number at the top of `logs\jarvis.log` and by `.venv\Scripts\python -m sounddevice`.
 - `logs\jarvis.log` says which mic it opened (`mic open: ...`), and every time something sounds a bit like "Hey Jarvis" it logs a line such as `wake score 0.31 (threshold 0.50): missed; mic level 12%`. Scores that keep landing just under the threshold mean `WAKE_THRESHOLD` can come down (try 0.3); a low mic level means turning the mic up in Windows' sound settings.
 - If the mic sends nothing but digital silence for 5 seconds (Windows' privacy switch, or a muted mic), Jarvis says so out loud once and logs it.
-- The dashboard's mic meter shows whether it hears you and how close you get to the wake threshold. Win+J is the fallback (if Windows or another app already owns it, the log says so; pick another `HOTKEY_LISTEN`).
+- The dashboard's mic meter shows whether it hears you; the line under it shows the wake word score and the threshold. Win+J is the fallback (if Windows or another app already owns it, the log says so; pick another `HOTKEY_LISTEN`).
 
 ## Choose a model
 
@@ -132,7 +134,9 @@ VOCAB = "Jarvis, Pepper, Manchester, Spotify, Discord, Outlook."
 | `HOTKEY_LISTEN` / `HOTKEY_STOP` | Global hotkeys, default Win+J and Win+Shift+J |
 | `WIDGET_*` | Which monitor (`"left"`, `"right"` or a name) and where: `bottom-center` (default), `top-center` or a corner |
 
-Restart after changing the config: `Stop-ScheduledTask Jarvis; Start-ScheduledTask Jarvis` in PowerShell.
+Restart after changing the config: `"Jarvis", "Jarvis Widget" | % { Stop-ScheduledTask $_; Start-ScheduledTask $_ }` in PowerShell.
+
+A mistake inside `config_local.py` (a typo, an import that fails) now stops Jarvis with the error in `logs\console.log`, instead of quietly running on the defaults.
 
 ## Run and control
 
@@ -140,10 +144,11 @@ It starts at logon by itself. To run it by hand instead (you see its log in the 
 
 The widget is a small capsule at the bottom centre of the screen. Resting, it's a little pill with a dim mic; it springs open when you talk to Jarvis, with one colour per state: a blue mic that pulses with your voice while listening, a white orb while thinking, a purple glow round the edge while he speaks, orange when he's waiting for a yes or no. It settles back a couple of seconds after he finishes. It never takes the mouse or keyboard. (The Linux version blurs what's behind it; Windows can't blur behind a shape, so here it's a translucent dark fill.)
 
-Dashboard: **http://127.0.0.1:8765** (this PC only). It shows what Jarvis is doing, background workers, history with every step and screenshot, what it heard, and has Yes/No buttons and a box for typed commands.
+Dashboard: run `.venv\Scripts\python jarvisctl.py dashboard`. It opens http://127.0.0.1:8765 (this PC only) with the key from `logs\ctl.token`, so other Windows accounts on the same PC can't see or drive it; your browser keeps the key in a cookie, so later visits and Jarvis restarts don't need it again (delete `logs\ctl.token` to change it). On a shared PC keep the Jarvis folder inside your own user folder. The dashboard shows what Jarvis is doing, background workers, history with every step and screenshot, what it heard, and has Yes/No buttons and a box for typed commands.
 
 | Do | How |
 |---|---|
+| Dashboard | `python jarvisctl.py dashboard` |
 | Talk | "Hey Jarvis", **Win+J**, or `python jarvisctl.py listen` |
 | Interrupt / cancel | Talk over it, say "Hey Jarvis", **Win+Shift+J**, or `python jarvisctl.py stop` |
 | Type instead of talk | The dashboard box, or `python jarvisctl.py say open spotify` |
@@ -153,7 +158,7 @@ Dashboard: **http://127.0.0.1:8765** (this PC only). It shows what Jarvis is doi
 | "Where is...?" | Ask "where's the volume mixer?" and it rings, points at and labels it on screen (`annotate`), then clears it |
 | Bug report | Double-click `report.bat`, or `python jarvisctl.py report` (see below) |
 | Fresh session | Say "new session" |
-| Uninstall | `Unregister-ScheduledTask Jarvis`, then delete the folder |
+| Uninstall | `Unregister-ScheduledTask Jarvis; Unregister-ScheduledTask "Jarvis Widget"`, then delete the folder |
 
 After you answer, it listens for 5 seconds so you can follow up without the wake word. If a hotkey is already taken by Windows or another app, the log says so; pick another in `config_local.py`.
 
@@ -161,7 +166,7 @@ After you answer, it listens for 5 seconds so you can follow up without the wake
 
 Double-click **`report.bat`** in the Jarvis folder (or run `.venv\Scripts\python jarvisctl.py report`). It makes `jarvis-report-<date>.zip` on your Desktop and opens Explorer on it; send that file (Discord, a GitHub issue). Nothing is uploaded by itself. It works even when Jarvis isn't running.
 
-Inside: the logs (`jarvis.log` and its old copies, `console.log`, the activity log `events.jsonl`, which includes what Jarvis heard and said), the wake score and microphone lines on their own (`wake-and-mic.txt`), Python and Windows versions, the installed packages, the microphone list, and `config.py` / `config_local.py`. API keys, tokens and passwords are replaced with `<redacted>`: any setting whose name contains KEY, TOKEN, SECRET, PASSWORD or AUTH, plus anything shaped like a key. Screenshots, `notes.md` and the dashboard token are left out. Have a look inside before sending if you're unsure.
+Inside: the logs (`jarvis.log` and its old copies, `console.log`, the activity log `events.jsonl`, which includes what Jarvis heard and said), the wake score and microphone lines on their own (`wake-and-mic.txt`), Python and Windows versions, the installed packages, the microphone list, and `config.py` / `config_local.py`. API keys, tokens and passwords are replaced with `<redacted>`: the values of your settings whose name contains KEY, TOKEN, SECRET, PASSWORD or AUTH (wherever they turn up), fields like `"password": "..."`, passwords inside URLs, and anything shaped like a key. Screenshots, `notes.md`, the dashboard token and the text Jarvis typed or wrote into files are left out. What you said and what Jarvis said are still in `events.jsonl`, and redaction can't catch a secret it can't recognise, so have a look inside before sending.
 
 ## Sessions and notes
 
@@ -176,9 +181,12 @@ For a job that takes more than a minute, or when you say "and also have Y going"
 The rules are `policy` in `brain.py`.
 
 - Allowed without asking: the desktop tools (except Enter), PowerShell commands that only read or compute, and `write_file` inside your home folder and `WRITE_OK_DIRS`.
-- Asks out loud first, with a spoken yes/no: PowerShell that deletes, moves, copies over or writes files, kills processes, changes services, scheduled tasks, the registry or system settings, installs software, runs elevated, pushes with git, or sends data to the web (POST and friends); `write_file` outside your home or into `.ssh`, your PowerShell profile, the Startup folder or the Jarvis folder itself; pressing Enter (that is how most apps send); and any tool it doesn't know.
-- Clicks are not gated, so the persona tells it to ask before clicking Send, Post, Buy or Delete.
-- No answer counts as no.
+- Asks out loud first, with a spoken yes/no: PowerShell that deletes, moves, copies over, creates or writes files, downloads files, kills processes, starts programs or another shell, changes services, scheduled tasks, the registry or system settings, installs software, runs elevated, pushes with git, or sends data to the web (POST and friends); `write_file` outside your home or into `.ssh`, your PowerShell profile (found even when OneDrive moved Documents), the Startup folder or the Jarvis folder itself; `open_path` on a program, script or shortcut; pressing Enter (that is how most apps send); and any tool it doesn't know.
+- The question says what will really happen, from the actual arguments: the command itself ("Shall I run Remove-Item notes.txt (delete the old notes)?"), or the full path of the file and whether it already exists. The model's own description only rides along in brackets.
+- Only a plain yes counts: "yes", "yeah, go ahead", "okay, do it, sir". Anything else is a no, including "I'm not sure", "not okay" and "I can't confirm that". No answer counts as no.
+- Clicks are not gated, so the persona (and each worker's brief) tells it to ask before clicking Send, Post, Buy or Delete.
+- One at a time on the desktop: while Jarvis or a worker is using the mouse and keyboard in a request or job, the others are told it's busy. Each keeps its own screenshot, so clicks land where that one looked.
+- Stop (the hotkey, the dashboard, `jarvisctl stop`) ends Jarvis's typing mid-word, kills his running command together with the programs it started, and drops anything you said that was still being transcribed. Background workers keep going; stop those by name.
 
 The command rules are a pattern match on the command text, not a sandbox: a determined model can get round them (for example by building a command string at runtime). Read `policy` before you trust it with anything important, and add your own rules there. Smaller local models follow the persona less reliably than large hosted ones.
 
@@ -189,7 +197,7 @@ Kokoro works out of the box with British voices (`bm_lewis` is the default). For
 ## Tests
 
 ```
-.venv\Scripts\python test_brain.py      # agent loop against a fake model server, safety rules, workers, hotkeys
+.venv\Scripts\python test_brain.py      # agent loop against a fake model server, safety rules, yes/no parsing, workers, hotkeys
 .venv\Scripts\python test_time_tag.py   # the greeting time tags
 .venv\Scripts\python test_voice.py "Good evening."   # writes logs\voice-kokoro.wav
 ```
@@ -203,6 +211,7 @@ This port is written and checked on Linux: every file compiles, `test_brain.py` 
 - **Changed after the first Windows report:** "Hey Jarvis" was rarely heard (cause not confirmed yet; the port now logs the mic it opened and every near-miss wake score, warns when the mic is digitally silent, and `MIC_DEVICE` by name no longer crashes on Windows' duplicate device names); background work didn't happen, most likely because of Gemini (its thought signatures were dropped, which Gemini 3 rejects on the request after any tool call, and two tool calls in one Gemini reply were merged into one broken call; the persona now also insists on actually calling `start_worker`); the old corner panel is replaced by the new capsule widget, and `annotate` is ported.
 - **Still not verified on real Windows:** whether those changes actually fix the wake word on the tester's mic; the new widget and the `annotate` overlay on Windows (placement above the taskbar, click-through, high-DPI and multi-monitor: the overlay works in physical pixels, so its labels look smaller on a scaled display; it can't draw over exclusive-fullscreen games); WASAPI devices with automatic conversion; `report.bat` and finding a OneDrive-moved Desktop.
 - **Not verified at all:** `install.ps1` end to end, including the Task Scheduler task (logon start, windowless `pythonw`, restart on failure); everything in `winapi.py` (SendInput typing and keys, mouse moves and clicks on multi-monitor and high-DPI setups, window listing and the focus-stealing workaround in `focus()`, RegisterHotKey with Win+J); `open_app` / `list_apps` through `Get-StartApps` and `shell:AppsFolder`; screenshots with `mss` (monitors left of or above the main one, DPI scaling), volume through `pycaw`, media keys, `plyer` notifications; `run_command` through Windows PowerShell 5.1 and the gate's PowerShell patterns on real-world commands; whisper and Kokoro speed on typical hardware.
+- **Changed after the second Windows report (a code review), checked only on Linux and with fake inputs:** the strict yes/no, the gate's new rules and questions, the dashboard key and cookie (checked in Chrome against a stand-in Jarvis), workers' timeline in the history, the step limit per tool call, one desktop driver at a time, per-agent screenshots, Stop cancelling typing and transcripts. Not run on Windows at all yet: the two logon tasks, the model re-download check in `install.ps1`, SendInput failure reporting, cancelling typing mid-word, killing a command's child processes, the OneDrive-moved Documents and Startup lookups, the exit code after a crash.
 - **Providers:** only the OpenAI-compatible protocol was tested, against a fake server (including Gemini's quirks as documented: no `index` on streamed tool calls, whole calls in one chunk, repeated ids, `extra_content.google.thought_signature`, and no empty-properties schemas). Real tool calling and image input through Ollama, OpenAI, Anthropic's compatible endpoint, OpenRouter, Groq and Gemini were not exercised here. Media "status" (what is playing) is not available on Windows and says so.
 
 Issues and fixes from Windows users are very welcome; please attach the `report.bat` zip.
