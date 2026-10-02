@@ -33,6 +33,7 @@ CAP_MAX_H = 132
 PAD_X, PAD_TOP, PAD_BOTTOM = 22, 20, 26       # room around the capsule for its shadow and edge glow
 W, H = CAP_W + 2 * PAD_X, CAP_MAX_H + PAD_TOP + PAD_BOTTOM
 PORT = 8765
+TOKEN_FILE = os.path.join(config.JARVIS_DIR, "logs", "ctl.token")
 ACTIVE = ("listening", "thinking", "speaking", "waiting")   # open while these last; a small pill otherwise
 REST_W, REST_H = 112, 32                      # the resting pill (a collapsed Dynamic Island)
 LINGER_S = 2.5                                # stays up this long after he finishes, then tucks away
@@ -73,13 +74,14 @@ class Feed(QObject):
     """Asks Jarvis what's happening several times a second (a tiny local request, about 2 ms)."""
     event = Signal(dict)
 
+    token = ""
+
     def start(self):
         threading.Thread(target=self._run, daemon=True).start()
 
-    @staticmethod
-    def _get(path):
+    def _get(self, path):
         c = http.client.HTTPConnection("127.0.0.1", PORT, timeout=3)
-        c.request("GET", path, headers={"Host": f"127.0.0.1:{PORT}"})
+        c.request("GET", path, headers={"Host": f"127.0.0.1:{PORT}", "X-Jarvis-Token": self.token})
         r = c.getresponse()
         body = r.read()
         c.close()
@@ -92,6 +94,10 @@ class Feed(QObject):
             try:
                 if use_live:
                     status, body = self._get("/api/live")
+                    if status == 403:          # Jarvis made a new key (first start): read it again
+                        with open(TOKEN_FILE) as f:
+                            self.token = f.read().strip()
+                        status, body = self._get("/api/live")
                     if status == 404:
                         use_live = False       # an older Jarvis without /api/live: use the full status instead
                         continue
@@ -151,7 +157,7 @@ class Widget(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.setFixedSize(W, H)
-        self.activity = "offline"
+        self.activity = ""                # unknown until the first poll, so starting with Jarvis off still says so
         self.mic = self.out = 0.0         # smoothed levels
         self.mic_raw = self.out_raw = 0.0
         self.you = ""                     # what you said (live, then final)
@@ -447,7 +453,7 @@ class Widget(QWidget):
             p.setFont(self.font_text)
             p.setPen(d.SECONDARY if dim else d.LABEL)
             box = QRectF(left, body_top, right - left, bottom - body_top)
-            p.drawText(box, Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap, self.fit(p, text, box))
+            p.drawText(box, Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap, self.fit(p, text, box, a == "waiting"))
         if footer:
             p.setFont(self.font_label)
             p.setBrush(d.color("background"))
@@ -555,17 +561,19 @@ class Widget(QWidget):
             p.drawEllipse(c + QPointF(math.cos(ang), math.sin(ang)) * (r + 6), 2.5, 2.5)
 
     @staticmethod
-    def fit(p, text, box):
-        """Show the END of long text (the newest words), trimmed from the front."""
+    def fit(p, text, box, keep_start=False):
+        """Show the END of long text (the newest words), trimmed from the front; a yes/no question keeps its START
+        (what it would do, and to what), trimmed from the end."""
         flags = Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap
         if p.boundingRect(box, flags, text).height() <= box.height():
             return text
-        words = text.split()
+        words, shown = text.split(), text
         while len(words) > 1:
-            words.pop(0)
-            if p.boundingRect(box, flags, "... " + " ".join(words)).height() <= box.height():
+            words.pop(-1 if keep_start else 0)
+            shown = " ".join(words) + " ..." if keep_start else "... " + " ".join(words)
+            if p.boundingRect(box, flags, shown).height() <= box.height():
                 break
-        return "... " + " ".join(words)
+        return shown
 
 
 def main():

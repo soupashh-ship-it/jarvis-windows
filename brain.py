@@ -550,16 +550,24 @@ def preview(content, n=300):
     return " ".join(c["text"] if c["type"] == "text" else "[image]" for c in content)[:n]
 
 
+DESK = {"owner": None}     # the agent driving the mouse and keyboard; one at a time
+
+
 class Agent:
     """A conversation with the model and the loop that runs its tool calls. Jarvis is one; each worker is another."""
     MAX_MESSAGES = 200
 
-    def __init__(self, system, permit, tools, on_text=None, model=None, sub=False):
+    def __init__(self, system, permit, tools, on_text=None, model=None, sub=False, name="Jarvis"):
         self.system, self.permit, self.on_text, self.model, self.sub = system, permit, on_text, model, sub
+        self.name = name
         self.tools = {f.spec["function"]["name"]: f for f in tools}
         self.messages = []
         self.steps = 0
         self.antigravity = AntigravitySession(model) if config.LLM_PROVIDER == "antigravity" else None
+        self.shot = {"x": 0, "y": 0, "scale": 1.0, "agent": name, "sub": sub}   # its own last screenshot's mapping
+
+    def who(self):
+        return f"the {self.name} worker" if self.sub else "Jarvis"
 
     async def close(self):
         if self.antigravity:
@@ -576,9 +584,17 @@ class Agent:
 
     async def run(self, prompt):
         """One request: model, tools, model... until it answers without a tool. Returns its last words."""
+        pctools.SHOT.set(self.shot)       # this task's clicks map through this agent's screenshot, not another's
+        try:
+            return await self._run(prompt)
+        finally:
+            if DESK["owner"] is self:
+                DESK["owner"] = None
+
+    async def _run(self, prompt):
         self.messages.append({"role": "user", "content": prompt})
         self.steps = 0
-        for _ in range(config.MAX_STEPS):
+        while self.steps < config.MAX_STEPS:
             self.trim()
             msg = await self.complete([{"role": "system", "content": self.system}] + self.messages)
             if self.on_text:
@@ -591,13 +607,16 @@ class Agent:
             images, answered = [], set()
             try:
                 for call in msg["tool_calls"]:
+                    if self.steps >= config.MAX_STEPS:
+                        break
                     content = await self.call(call)
                     self.messages.append({"role": "tool", "tool_call_id": call["id"], "content": " ".join(
                         c["text"] for c in content if c["type"] == "text") or "done"})
                     answered.add(call["id"])
                     images += [c for c in content if c["type"] == "image"]
-            finally:                                # interrupted: every tool call still needs an answer
-                self.messages += [{"role": "tool", "tool_call_id": c["id"], "content": "Not run: the user interrupted."}
+            finally:                                # interrupted or over the limit: every tool call still needs an answer
+                why = "the step limit was reached" if self.steps >= config.MAX_STEPS else "the user interrupted"
+                self.messages += [{"role": "tool", "tool_call_id": c["id"], "content": f"Not run: {why}."}
                                   for c in msg["tool_calls"] if c["id"] not in answered]
             if images and config.LLM_VISION:        # most APIs only take images from the user, so hand them over
                 self.messages.append({"role": "user", "content": [{"type": "text", "text": "The screen from that step:"}] + [
@@ -611,15 +630,22 @@ class Agent:
         except ValueError:
             args = None
         log.info("tool: %s %s", name, call["function"]["arguments"][:200])
-        events.emit("tool_use", tool_id=call["id"], name=name, input=json.dumps(args)[:1500], sub=self.sub)
+        events.emit("tool_use", tool_id=call["id"], name=name, input=json.dumps(args)[:1500], sub=self.sub,
+                    agent=self.name)
         error = True
         if not isinstance(args, dict):
             result = pctools.text(f"The arguments for {name} weren't valid JSON. Try again.")
         elif name not in self.tools:
             result = pctools.text(f"There is no tool called {name}.")
+        elif name in pctools.DESKTOP and DESK["owner"] not in (None, self):
+            # ponytail: the driver keeps the desktop for its whole request or job; upgrade path is an idle timeout
+            result = pctools.text(f"Not run: {DESK['owner'].who()} is using the mouse and keyboard right now. "
+                                  "Wait until it has finished, or tell the user it is busy.")
         elif not await self.permit(name, args):
             result = pctools.text("The user said no (or didn't answer). Don't retry it; say so briefly.")
         else:
+            if name in pctools.DESKTOP:
+                DESK["owner"] = self
             try:
                 result, error = await self.tools[name](args), False
             except Exception as e:
@@ -656,11 +682,15 @@ RISKY_COMMAND = re.compile(
     r"reg|reg\.exe|set-itemproperty|sp|new-itemproperty|remove-itemproperty|rp|set-executionpolicy|"
     r"set-acl|icacls|takeown|cipher|format|format-volume|diskpart|bcdedit|netsh|runas|sudo|"
     r"invoke-expression|iex|winget|choco|scoop|msiexec|uninstall-\S+|install-\S+|disable-\S+|enable-\S+|"
+    r"new-item|ni|expand-archive|compress-archive|start-bitstransfer|bitsadmin|certutil|start-process|saps|start|"
+    r"cmd|cmd\.exe|powershell|powershell\.exe|pwsh|pwsh\.exe|wsl|bash|"
     r"send-mailmessage|ssh|scp|rsync|chmod|chown|dd|truncate|crontab|systemctl)(?=[\s;|)}]|$)"
     r"|" + _CMD + r"git\s+(push|reset|clean|checkout\s+--)"
     r"|-verb\s+runas"
-    r"|\b(invoke-webrequest|invoke-restmethod|iwr|irm|curl)\b.*\s-(method\s+['\"]?(post|put|patch|delete)|body|infile)\b"
-    r"|\bcurl(\.exe)?\b.*(\s-X\s*['\"]?(POST|PUT|PATCH|DELETE)|\s(-d|--data\S*|-F|--form|-T|--upload-file)\s)"
+    r"|\b(invoke-webrequest|invoke-restmethod|iwr|irm|curl|wget)\b[^|;\n]*\s-(method\s+['\"]?(post|put|patch|delete)|body|infile|outf\w*)\b"
+    r"|\bcurl(\.exe)?\b[^|;\n]*(\s-X\s*['\"]?(POST|PUT|PATCH|DELETE)|\s-[a-z]*(?-i:[oOdFT])|\s--(output|remote-name|data|json|form|upload-file))"
+    r"|\[(system\.)?io\.(file|directory)\]::(write|append|delete|move|copy|create|replace|open)"
+    r"|\.(downloadfile|uploadfile|uploadstring|uploaddata|uploadvalues)\b"
     r"|(?<![-=2])>(?!&)(?!\s*\$null)", re.I | re.M)
 
 
@@ -668,9 +698,13 @@ def _norm(p):
     return os.path.normcase(os.path.realpath(p))
 
 
-SENSITIVE_PATHS = [os.path.join(config.HOME, p) for p in (
-    ".ssh", ".gitconfig", r"AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup",
-    r"Documents\WindowsPowerShell", r"Documents\PowerShell")] + [config.JARVIS_DIR]   # incl. its own safety rules
+_DOCS = {os.path.join(config.HOME, "Documents"), winapi.known_folder(0x05, os.path.join(config.HOME, "Documents"))}
+SENSITIVE_PATHS = [os.path.join(config.HOME, p) for p in (".ssh", ".gitconfig")] + [
+    winapi.known_folder(0x07, os.path.join(config.HOME, r"AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup")),
+    config.JARVIS_DIR] + [os.path.join(d, p) for d in _DOCS for p in ("WindowsPowerShell", "PowerShell")]
+# the PowerShell profiles live in the real Documents folder, which OneDrive often moves; Jarvis's own folder holds its rules
+RUNNABLE = {".exe", ".com", ".bat", ".cmd", ".ps1", ".vbs", ".vbe", ".js", ".jse", ".wsf", ".wsh", ".hta", ".msi",
+            ".msc", ".scr", ".cpl", ".pif", ".lnk", ".url", ".reg", ".appref-ms"}
 
 
 def policy(name, data):
@@ -679,6 +713,10 @@ def policy(name, data):
         return "confirm" if re.search(r"\b(enter|return)\b", data.get("keys", ""), re.I) else "allow"
     if name == "run_command":
         return "confirm" if RISKY_COMMAND.search(data.get("command", "")) else "allow"
+    if name == "open_path":                         # opening a program or script runs it; a web link just opens the browser
+        target = data.get("target", "")
+        web = re.match(r"(?i)(https?|mailto):", target)
+        return "confirm" if not web and os.path.splitext(target)[1].lower() in RUNNABLE else "allow"
     if name == "write_file":
         path = _norm(os.path.join(config.HOME, os.path.expanduser(data.get("path", ""))))
         roots = [_norm(r) for r in [config.HOME, config.RUNTIME_DIR] + config.WRITE_OK_DIRS]
@@ -689,14 +727,31 @@ def policy(name, data):
 
 
 def describe(name, data):
+    """What is being approved, from the real arguments; the model's own description only rides along."""
     if name == "run_command":
-        desc = data.get("description")
-        return desc[0].lower() + desc[1:] if desc else f"run this command: {data.get('command', '')[:120]}"
+        cmd, desc = re.sub(r"\s*\n\s*", "; ", data.get("command", "").strip()), data.get("description", "").strip()
+        m = RISKY_COMMAND.search(cmd)
+        start = m.start() if m and m.end() > 160 else 0            # long: show the part that made it risky
+        shown = ("..." if start else "") + cmd[start:start + 160] + ("..." if len(cmd) > start + 160 else "")
+        return f"run {shown}" + (f" ({desc[0].lower() + desc[1:]})" if desc else "")
     if name == "write_file":
-        return f"write the file {os.path.basename(data.get('path', ''))}"
+        path = os.path.normpath(os.path.join(config.HOME, os.path.expanduser(data.get("path", ""))))
+        return f"{'overwrite' if os.path.exists(path) else 'create'} the file {path}"
     hints = [str(v) for k, v in data.items() if isinstance(v, str) and 0 < len(v) < 80
              and k in ("name", "title", "query", "text", "keys", "target")][:2]
     return name.replace("_", " ") + (": " + ", ".join(hints) if hints else "")
+
+
+_AFFIRM = (r"yes|yeah|yep|yup|sure|ok|okay|go ahead|go for it|do it|do so|confirm|confirmed|affirmative|absolutely|"
+           r"certainly|of course|please do|proceed|send it|allow it")
+_FILLER = r"please|sir|ma'am|maam|boss|jarvis|" + re.escape(" ".join(re.findall(r"[a-z']+", config.HONORIFIC.lower())))
+
+
+def approved(answer):
+    """True only when the whole answer is a plain yes ("Yes.", "Yeah, go ahead, sir."). Anything else is a no:
+    "I'm not sure", "not okay", "I can't confirm that", "yes, but not that one", silence."""
+    words = " ".join(re.findall(r"[a-z']+", (answer or "").lower()))
+    return bool(re.fullmatch(rf"(?:(?:{_FILLER}) )*(?:{_AFFIRM})(?: (?:{_AFFIRM}|{_FILLER}))*", words))
 
 
 # ---------- notes between sessions ----------
@@ -804,6 +859,7 @@ class Brain:
                        + notes)
         previous = self.agent
         self.agent = Agent(system, self.gate, list(pctools.TOOLS.values()), on_text=self._text)
+        self.splitter = SentenceSplitter()
         if previous:
             asyncio.create_task(previous.close())
         if self.agent.antigravity:

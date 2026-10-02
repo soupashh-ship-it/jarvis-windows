@@ -9,3 +9,4 @@ config_local.py
 .env.*
 !.env.example
 *.bak*
+reviews/

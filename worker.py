@@ -24,6 +24,8 @@ JARVIS, {name}'s voice assistant, started you to do one job in the background on
 - Work on your own with your tools. Risky steps are put to {name} out loud for you; if the answer is no, find another way or stop.
 - Finish with one or two plain sentences: what you did and where the result is. That line is read out to {name}.
 - If you need a decision or information, end with a line starting "NEED USER:" and the question.
+- Clicks are not checked with {name}. Before clicking anything that sends, posts, submits, buys, books or deletes, stop and end with "NEED USER:" asking whether to, unless {name} has already said yes to exactly that.
+- Only one of you (Jarvis or a worker) can use the mouse and keyboard at a time. If a tool says they are in use, do other parts of the job or wait; don't fight over the screen.
 """
 
 
@@ -36,12 +38,12 @@ class Worker:
         self.name, self.state, self.last, self.started = name, "starting", "", time.time()
         tools = [f for n, f in pctools.TOOLS.items() if n not in NAMES]
         self.agent = brain.Agent(BRIEF.format(name=config.USER_NAME, home=config.HOME), self.permit, tools,
-                                 model=config.WORKER_MODEL or None, sub=True)
+                                 model=config.WORKER_MODEL or None, sub=True, name=name)
         self.runner = asyncio.create_task(self.run(task))
 
-    def set(self, state):
+    def set(self, state, **extra):
         self.state = state
-        events.emit("worker", name=self.name, state=state, text=self.last[-500:])
+        events.emit("worker", name=self.name, state=state, text=self.last[-500:], **extra)
 
     def tell(self):
         notify(f"[worker update, not from {config.USER_NAME}] The {self.name} worker is {self.state}. "
@@ -51,7 +53,7 @@ class Worker:
     async def permit(self, tool_name, data):
         if brain.policy(tool_name, data) == "allow":
             return True
-        self.set("waiting")
+        self.set("waiting", asking=True)
         ok = await confirm(f"{config.HONORIFIC.capitalize()}, the {self.name} worker would like to "
                            f"{brain.describe(tool_name, data)}. Shall I allow it?")
         self.set("running")
