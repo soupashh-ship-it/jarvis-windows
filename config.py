@@ -30,7 +30,7 @@ LLM_MODEL = "gemini-3.8-flash-high"
 LLM_VISION = True          # False if the model can't read images (Jarvis then can't look at screenshots)
 WORKER_MODEL = ""          # optional model for background workers; "" = same as LLM_MODEL
 MAX_STEPS = 30             # tool calls per request before Jarvis gives up
-VERIFY_MAX_ROUNDS = 2      # after a turn that changed the PC, re-check the claim this many times (0 = never)
+VERIFY_MAX_ROUNDS = 3      # after any change to the PC, re-check the claim up to this many times (0 = never)
 VERIFY_PROMPT = (
     "Before you answer, verify what you just claimed: check it with a tool now (re-read the file, list the folder, "
     "look at the window, read the timer list) instead of trusting the earlier result. Fix anything wrong, then check "
