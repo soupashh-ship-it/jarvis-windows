@@ -7,6 +7,7 @@ import base64
 import contextvars
 import io
 import json
+import logging
 import os
 import re
 import subprocess
@@ -26,7 +27,10 @@ TOOLS = {}                 # name -> async function, with .spec for the model
 TYPES = {str: "string", int: "integer", bool: "boolean"}
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)          # Jarvis runs windowless; so must its commands
 PS_UTF8 = "[Console]::OutputEncoding = [Text.Encoding]::UTF8; "
-DESKTOP = {"open_app", "focus_window", "click_at", "move_mouse", "scroll", "type_text", "press_keys"}  # one agent at a time
+DESKTOP = {"open_app", "focus_window", "click_at", "move_mouse", "scroll", "type_text", "press_keys", "ui_click"}  # one agent at a time
+MUTATES = {"open_app", "focus_window", "click_at", "move_mouse", "scroll", "type_text", "press_keys", "ui_click",
+           "run_command", "write_file", "organize_folder", "calendar_add", "set_timer", "cancel_timer",
+           "volume", "app_volume", "media", "open_path", "forget"}                     # tools that change the world
 NOTIFY = None              # (message) -> None, speak a message later; set by jarvis.py
 
 
@@ -122,11 +126,14 @@ async def list_apps(args):
 
 @tool("open_path", "Open a file, folder or URL with its default app.", {"target": str})
 async def open_path(args):
+    target = args.get("target") or args.get("path") or args.get("url") or args.get("file") or ""
+    if not str(target).strip():
+        return text("Tell me what to open (a file, a folder, or a URL).")
     try:
-        os.startfile(os.path.expanduser(args["target"]))
+        os.startfile(os.path.expanduser(str(target)))
     except OSError as e:
-        return text(f"Couldn't open {args['target']}: {e}")
-    return text(f"Opened {args['target']}.")
+        return text(f"Couldn't open {target}: {e}")
+    return text(f"Opened {target}.")
 
 
 # ---------- media and volume ----------
@@ -374,8 +381,9 @@ async def cancel_timer(args):
 
 # ---------- UI-Automation clicking ----------
 
-@tool("ui_click", "Click a button/link/menu item by its visible text, using Windows UI Automation instead of "
-      "pixel coordinates. More reliable than click_at. text: the label, e.g. 'Send', 'Save', 'Download'.",
+@tool("ui_click", "Click a button/link/menu item by its visible text inside the window that is currently in front, "
+      "using Windows UI Automation instead of pixel coordinates. Only that focused window is searched, so it will "
+      "never touch another app. text: the label, e.g. 'Send', 'Save', 'Download'.",
       {"text": str})
 async def ui_click(args):
     needle = args["text"].strip().lower()
@@ -384,30 +392,42 @@ async def ui_click(args):
     def run():
         from pywinauto import Desktop
         active = winapi.active_window() or {}
-        roots = []
-        if active.get("title"):
+        if not active.get("title"):
+            return "NO_WINDOW"
+        try:
+            root = Desktop(backend="uia").window(title_re=f".*{re.escape(active['title'][:40])}.*")
+            root.wait("exists ready", timeout=2)
+        except Exception:
+            return "NO_WINDOW"
+        best = None
+        for el in root.descendants():
             try:
-                roots = [Desktop(backend="uia").window(title_re=f".*{re.escape(active['title'][:40])}.*")]
-            except Exception:
-                pass
-        roots.append(Desktop(backend="uia"))
-        for root in roots:
-            try:
-                for el in root.descendants():
-                    try:
-                        if needle in (el.window_text() or "").lower():
-                            el.click_input()
-                            return el.window_text()
-                    except Exception:
-                        continue
+                ctype = el.element_info.control_type
             except Exception:
                 continue
+            if ctype not in ("Button", "MenuItem", "Hyperlink", "TabItem", "TreeItem", "ListItem", "Text"):
+                continue
+            try:
+                if needle in (el.window_text() or "").lower() and el.is_visible() and el.is_enabled():
+                    # prefer an exact label match, else first substring hit
+                    if (el.window_text() or "").strip().lower() == needle:
+                        el.click_input()
+                        return el.window_text()
+                    if best is None:
+                        best = el
+            except Exception:
+                continue
+        if best is not None:
+            best.click_input()
+            return best.window_text()
         return None
     try:
         hit = await asyncio.to_thread(run)
     except Exception as e:
         return text(f"UI click failed: {e}")
-    return text(f"Clicked '{hit}'." if hit else f"No visible control matching '{args['text']}' in the active window.")
+    if hit == "NO_WINDOW":
+        return text("I couldn't tell which window is in front. Bring it to the front and tell me again.")
+    return text(f"Clicked '{hit}'." if hit else f"No clickable control matching '{args['text']}' in the front window.")
 
 
 # ---------- browser automation ----------
@@ -515,60 +535,160 @@ async def clipboard(args):
     return text(out.strip() if out.strip() else "The clipboard is empty (or holds no text).")
 
 
-# ---------- calendar ----------
+# ---------- calendar & email (classic Outlook via COM, .ics fallback) ----------
 
-@tool("calendar_add", "Create a calendar event as an .ics file in ~/calendar and open it (Outlook imports it). "
-      "title: event name. start: 'YYYY-MM-DD HH:MM' or 'YYYY-MM-DDTHH:MM'. duration_minutes: default 30.",
-      {"title": str, "start": str, "duration_minutes": int})
-async def calendar_add(args):
-    import datetime, re as _re
-    start = None
-    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%d %B %Y %H:%M", "%d/%m/%Y %H:%M"):
+_OL_PRELUDE = ("$ErrorActionPreference='Stop'; $ol = New-Object -ComObject Outlook.Application; "
+               "$ns = $ol.GetNamespace('MAPI'); ")
+
+
+def _parse_start(raw):
+    import datetime
+    raw = (raw or "").strip()
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%d %B %Y %H:%M", "%d/%m/%Y %H:%M", "%d %b %Y %H:%M"):
         try:
-            start = datetime.datetime.strptime(args["start"].strip(), fmt)
-            break
+            return datetime.datetime.strptime(raw, fmt)
         except ValueError:
             continue
+    try:
+        return datetime.datetime.fromisoformat(raw.replace("Z", ""))
+    except Exception:
+        return None
+
+
+def _resolve_start(raw):
+    """'2026-10-04 15:30', '4 October 2026 09:00', 'tomorrow 15:30', 'today 23:15', 'friday 18:00' -> datetime."""
+    import datetime
+    exact = _parse_start(raw)
+    if exact:
+        return exact
+    now = datetime.datetime.now()
+    when = re.sub(r"[^\w: ]", " ", (raw or "").lower()).strip()
+    parts = when.split()
+    days = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+    day = None
+    if parts and parts[0] == "today":
+        day = 0
+    elif parts and parts[0] == "tomorrow":
+        day = 1
+    elif parts and parts[0] in days:
+        day = (days.index(parts[0]) - now.weekday()) % 7 or 7
+    clock = next((p for p in parts if ":" in p and p.replace(":", "").isdigit()), "")
+    if day is None or not clock:
+        return None
+    hh, mm = clock.split(":")
+    return (now + datetime.timedelta(days=day)).replace(hour=int(hh) % 24, minute=int(mm) % 60,
+                                                        second=0, microsecond=0)
+
+
+@tool("calendar_add", "Put an event in the user's Outlook calendar (classic Outlook is started if needed). Falls "
+      "back to writing an .ics in ~/calendar and opening it when Outlook isn't available. "
+      "title: event name. start: 'YYYY-MM-DD HH:MM' or 'tomorrow 15:30'. duration_minutes: default 30. "
+      "location: optional.", {"title": str, "start": str, "duration_minutes": int, "location": str})
+async def calendar_add(args):
+    import datetime
+    import re as _re
+    raw = args["start"].strip()
+    start = _resolve_start(raw)
     if start is None:
-        try:
-            start = datetime.datetime.fromisoformat(args["start"].replace("Z", ""))
-        except Exception:
-            return text(f"Couldn't read the start time '{args['start']}' — use 'YYYY-MM-DD HH:MM'.")
-    end = start + datetime.timedelta(minutes=max(5, min(1440, int(args.get("duration_minutes", 30)))))
+        return text(f"Couldn't read the start time '{args['start']}' — use 'YYYY-MM-DD HH:MM' or 'tomorrow 15:30'.")
+    minutes = max(5, min(1440, int(args.get("duration_minutes", 30))))
+    end = start + datetime.timedelta(minutes=minutes)
+    title = args["title"].strip()
+    location = (args.get("location") or "").strip()
+    when_txt = f"{start:%A %d %B, %H:%M} for {minutes} minutes"
+    # 1) the real calendar, when classic Outlook answers
+    def via_outlook():
+        import outlook
+        ps = (_OL_PRELUDE
+              + "$cal = $ns.GetDefaultFolder(9); $item = $cal.Items.Add(0); "
+              + "$item.Subject = '" + title.replace("'", "''") + "'; "
+              + f"$item.Start = Get-Date '{start:%Y-%m-%d %H:%M}'; "
+              + f"$item.End = Get-Date '{end:%Y-%m-%d %H:%M}'; ")
+        if location:
+            ps += "$item.Location = '" + location.replace("'", "''") + "'; "
+        ps += ("$item.Save(); "
+               + "$s = $item.Start.ToString('ddd dd MMM HH:mm'); "
+               + "Write-Output \"$s|$($item.Subject)\"")
+        return outlook.run(ps)[0]
+    try:
+        out = await asyncio.to_thread(via_outlook)
+        note = " (I had to start Outlook)" if "|" in out else ""
+        return text(f"Added '{title}' to your Outlook calendar{note}: {when_txt}.")
+    except Exception as e:                   # no Outlook: the .ics import path still gets the event in
+        note = f"Outlook isn't available ({e}), so I wrote an .ics and opened it to import."
     os.makedirs(os.path.join(config.HOME, "calendar"), exist_ok=True)
-    fname = _re.sub(r"[^\w -]", "", args["title"]).strip().replace(" ", "_") + ".ics"
+    fname = _re.sub(r"[^\w -]", "", title).strip().replace(" ", "_") + ".ics"
     path = os.path.join(config.HOME, "calendar", fname)
     stamp = lambda d: d.strftime("%Y%m%dT%H%M%S")
     body = (f"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:{int(time.time())}@jarvis\r\n"
             f"DTSTAMP:{stamp(datetime.datetime.utcnow())}\r\nDTSTART:{stamp(start)}\r\nDTEND:{stamp(end)}\r\n"
-            f"SUMMARY:{args['title']}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n")
+            f"SUMMARY:{title}\r\nLOCATION:{location}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n")
     with open(path, "w", encoding="utf-8", newline="\r\n") as f:
         f.write(body)
     try:
         os.startfile(path)
     except OSError:
         pass
-    return text(f"Calendar event '{args['title']}' for {start:%A %d %B, %H:%M}; saved to {path} and opened for import.")
+    return text(f"Event '{title}' {when_txt}; {note} Saved to {path}.")
 
 
-@tool("list_emails", "Show recent emails from Outlook (if installed): subject, sender, received time. count: how many (default 5).",
-      {"count": int})
-async def list_emails(args):
+@tool("list_events", "Show the user's upcoming Outlook calendar events (classic Outlook; the new Store app is not "
+      "supported). count: how many (default 5). days: how far ahead (default 14).", {"count": int, "days": int})
+async def list_events(args):
+    n = max(1, min(30, int(args.get("count", 5))))
+    days = max(1, min(365, int(args.get("days", 14))))
     def run():
-        import subprocess
-        n = max(1, min(20, int(args.get("count", 5))))
-        cmd = ("$ol = New-Object -ComObject Outlook.Application; $ns = $ol.GetNamespace('MAPI'); "
-               "$inbox = $ns.GetDefaultFolder(6); $items = $inbox.Items | Sort-Object ReceivedTime -Descending | "
-               f"Select-Object -First {n}; $items | ForEach-Object {{ \"$($_.ReceivedTime.ToString('dd MMM HH:mm')) | $($_.SenderName) | $($_.Subject)\" }}")
-        proc = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
-                              text=True, encoding="utf-8", errors="replace", capture_output=True, timeout=60,
-                              creationflags=NO_WINDOW)
-        return proc.stdout.strip() or proc.stderr.strip()
+        import outlook
+        ps = (_OL_PRELUDE
+              + "$cal = $ns.GetDefaultFolder(9); "
+              + f"$cal.Items | Where-Object {{ $_.Start -ge (Get-Date) -and $_.Start -le (Get-Date).AddDays({days}) }} "
+              + "| Sort-Object Start | Select-Object -First " + str(n)
+              + " | ForEach-Object { \"$($_.Start.ToString('ddd dd MMM HH:mm')) | $($_.Subject)\" }")
+        return outlook.run(ps)[0]
     try:
         out = await asyncio.to_thread(run)
     except Exception as e:
-        return text(f"Couldn't read Outlook: {e}. Is Outlook installed and signed in?")
-    return text(out[:3000] if out else "No emails found or Outlook isn't available.")
+        return text(f"Couldn't read the calendar: {e}")
+    return text(out[:2500] if out else f"No events in the next {days} days.")
+
+
+@tool("draft_email", "Save a new email as a draft in Outlook (classic Outlook) without sending it. "
+      "to: recipient. subject: subject line. body: the message.", {"to": str, "subject": str, "body": str})
+async def draft_email(args):
+    def run():
+        import outlook
+        q = lambda s: "'" + str(s).replace("'", "''") + "'"
+        ps = (_OL_PRELUDE
+              + "$item = $ns.GetDefaultFolder(6).Items.Add(0); "
+              + "$item.To = " + q(args["to"]) + "; "
+              + "$item.Subject = " + q(args["subject"]) + "; "
+              + "$item.Body = " + q(args["body"]) + "; "
+              + "$item.Save(); Write-Output 'saved'")
+        return outlook.run(ps)[0]
+    try:
+        await asyncio.to_thread(run)
+    except Exception as e:
+        return text(f"Couldn't save the draft: {e}")
+    return text(f"Draft saved to {args['to']}: \"{args['subject']}\". It's waiting in your Drafts — I didn't send it.")
+
+
+@tool("list_emails", "Show recent emails from Outlook. Classic Outlook for Windows is started if needed; the new "
+      "Store app is not supported. Returns subject, sender, received time. count: how many (default 5).", {"count": int})
+async def list_emails(args):
+    n = max(1, min(20, int(args.get("count", 5))))
+    def run():
+        import outlook
+        ps = (_OL_PRELUDE
+              + "$inbox = $ns.GetDefaultFolder(6); $items = $inbox.Items | Sort-Object ReceivedTime -Descending | "
+              + "Select-Object -First " + str(n)
+              + " | ForEach-Object { \"$($_.ReceivedTime.ToString('dd MMM HH:mm')) | $($_.SenderName) | $($_.Subject)\" }")
+        return outlook.run(ps)
+    try:
+        out, started = await asyncio.to_thread(run)
+    except Exception as e:
+        return text(f"Couldn't read Outlook: {e}")
+    note = "I had to start Outlook for that. " if started else ""
+    return text((note + out)[:3000] if out else f"{note}No emails found.")
 
 
 @tool("self_check", "Run the project's built-in checks (agent loop, safety rules, yes/no parsing, workers, time "
@@ -661,23 +781,58 @@ async def remember(args):
     return text(f"Noted: {args['fact'].strip()}")
 
 
-@tool("recall", "Read back the durable facts Jarvis has been told (remember tool), best matches first. Optional query "
-      "filters/reranks.", {"query": str})
-async def recall(args):
+@tool("forget", "Remove a durable fact Jarvis was told earlier, when it is out of date or was wrong. "
+      "query: a distinctive part of the fact to delete.", {"query": str})
+async def forget(args):
+    needle = args["query"].strip().lower()
+    if not needle:
+        return text("Tell me which fact to forget (quote part of it).")
     try:
         with open(_FACTS_FILE, encoding="utf-8") as f:
-            lines = [l.strip() for l in f.read().splitlines() if l.strip().startswith("-")]
+            lines = f.read().splitlines()
     except FileNotFoundError:
         return text("Nothing remembered yet.")
+    keep = [l for l in lines if needle not in l.lower()]
+    gone = len(lines) - len(keep)
+    if not gone:
+        return text(f"No remembered fact contains '{args['query']}'.")
+    with open(_FACTS_FILE, "w", encoding="utf-8") as f:
+        f.write("\n".join(keep) + ("\n" if keep else ""))
+    return text(f"Forgot {gone} line(s) containing '{args['query']}'. The rest are still there.")
+
+
+def _memory_lines():
+    """Durable facts first, then the cross-session notes, each line tagged with where it came from."""
+    out = []
+    try:
+        with open(_FACTS_FILE, encoding="utf-8") as f:
+            out += [("fact", l.strip()) for l in f.read().splitlines() if l.strip().startswith("-")]
+    except (FileNotFoundError, OSError):
+        pass
+    try:
+        with open(getattr(config, "NOTES_FILE", ""), encoding="utf-8") as f:
+            for l in f.read().splitlines():
+                l = l.strip().lstrip("#- ").strip()
+                if len(l) > 2 and not l.lower().startswith(("jarvis", "written", "session", "-", "notes")):
+                    out.append(("notes", l))
+    except (FileNotFoundError, OSError):
+        pass
+    return out
+
+
+@tool("recall", "Search everything Jarvis knows: durable facts (remember) and the notes it wrote in earlier "
+      "sessions, best matches first, each labelled with its source. Optional query filters/reranks.", {"query": str})
+async def recall(args):
+    rows = _memory_lines()
     query = args.get("query", "").lower().strip()
     if not query:
-        return text("\n".join(lines) if lines else "No matching facts.")
+        return text("\n".join(f"[{src}] {l}" for src, l in rows) if rows else "No matching facts.")
     # rank by a tiny TF-IDF cosine, so "what's my project name" finds a fact about the project
     import math
     def tokens(s):
         return set(re.findall(r"[a-z0-9']+", s.lower()))
     docs, idf = [], {}
-    for l in lines:
+    for _, l in rows:
         ts = tokens(l)
         docs.append((l, ts))
         for t in ts:
@@ -688,9 +843,11 @@ async def recall(args):
         if not q & ts:
             continue
         score = sum(1 / math.log(1 + idf[t]) for t in (q & ts)) / math.sqrt(len(ts) + 1)
+        if rows[i][0] == "fact":
+            score *= 1.15                            # a stated fact outranks a passing note
         scored.append((score, i, l))
     scored.sort(reverse=True)
-    return text("\n".join(l for _, _, l in scored[:8]) if scored else "No matching facts.")
+    return text("\n".join(f"[{rows[i][0]}] {l}" for _, i, l in scored[:8]) if scored else "No matching facts.")
 
 
 # ---------- windows, screen, mouse, keyboard ----------
@@ -919,7 +1076,10 @@ async def read_tail(stream, keep=32000):
       "description: a few plain words on what it does (read out if the user is asked to approve it). "
       "timeout: seconds, 1-600.", {"command": str, "description": str, "timeout": int})
 async def run_command(args):
-    shell = powershell(args["command"]) if os.name == "nt" else ["bash", "-c", args["command"]]
+    command = args.get("command") or args.get("cmd") or args.get("script") or args.get("command_line") or ""
+    if not str(command).strip():
+        return text("Tell me what to run: one PowerShell command, plus a short description.")
+    shell = powershell(command) if os.name == "nt" else ["bash", "-c", command]
     proc = await asyncio.create_subprocess_exec(*shell, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
                                                 stdin=asyncio.subprocess.DEVNULL, cwd=config.HOME, creationflags=NO_WINDOW)
     try:
@@ -948,7 +1108,64 @@ async def write_file(args):
         return text(f"Wrote {len(args['content'])} characters to {path}.")
 
 
+# ---------- self-written tools ----------
+
+PLUGIN_FILES = ("custom_tools",)           # modules Jarvis may write its own tools into
+
+log = logging.getLogger("jarvis.pctools")
+
+
+_BUILTIN_TOOLS = set()                  # filled in below, once the built-ins are all registered
+
+
+_PLUGIN_TOOLS = set()                     # names the plugins registered last time, so deletions can be noticed
+
+
+def load_plugins(reload=False):
+    """Import the plugin modules so their @tool functions register. Returns the names now loaded."""
+    import importlib
+    loaded = []
+    for mod_name in PLUGIN_FILES:
+        try:
+            if reload and mod_name in sys.modules:
+                del sys.modules[mod_name]      # reload() reuses the old namespace, so deleted tools would linger
+            mod = importlib.import_module(mod_name)
+            loaded += [n for n, f in vars(mod).items()
+                       if callable(f) and getattr(f, "spec", None) and f.spec["function"]["name"] in TOOLS]
+        except Exception as e:
+            log.warning("plugin %s failed to load: %s", mod_name, e)
+    global _PLUGIN_TOOLS
+    if reload:                             # a tool deleted from the file goes away instead of lingering
+        for gone in _PLUGIN_TOOLS - set(loaded):
+            TOOLS.pop(gone, None)
+    _PLUGIN_TOOLS = set(loaded) - _BUILTIN_TOOLS
+    return sorted(set(loaded))
+
+
 try:                                     # Jarvis can extend itself: custom_tools.py is picked up at startup
-    import custom_tools  # noqa: F401
+    load_plugins()
+except ImportError:
+    pass
+
+
+@tool("list_custom_tools", "List the tools Jarvis has written for itself in custom_tools.py.", {})
+async def list_custom_tools(args):
+    names = load_plugins(reload=True)
+    return text(", ".join(names) if names else "No custom tools yet.")
+
+
+@tool("reload_tools", "Re-read custom_tools.py so a tool Jarvis just wrote becomes available without a restart. "
+      "Use it after appending a new tool, then call the tool by name.", {})
+async def reload_tools(args):
+    before = set(TOOLS) - _BUILTIN_TOOLS
+    names = load_plugins(reload=True)
+    added = sorted(set(TOOLS) - _BUILTIN_TOOLS - before)
+    return text(f"{len(names)} custom tool(s) loaded{': ' + ', '.join(added) if added else ''}. "
+                f"Call them by name now; no restart needed.")
+
+
+_BUILTIN_TOOLS = set(TOOLS)              # what shipped with Jarvis, before any plugin is read
+try:                                     # Jarvis can extend itself: custom_tools.py is picked up at startup
+    load_plugins()
 except ImportError:
     pass

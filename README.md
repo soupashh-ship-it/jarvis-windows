@@ -234,13 +234,36 @@ WAKE_WORD_MODELS = ["hey_jarvis_v0.1.onnx", "hey_samantha.onnx"]
 
 A custom model is trained from openWakeWord's docs (same pipeline as their `hey_jarvis` training example); openWakeWord does not ship a `hey_samantha` model, and film audio is not redistributable, so train your own. The same applies for any phrase: put the `.onnx` in `models/`, add its filename to `WAKE_WORD_MODELS`, restart.
 
+## Extending Jarvis
+
+Jarvis can write its own tools. Append an async `@tool` function to `custom_tools.py`, then call **`reload_tools`** — the new tool is available on the next model call, with no restart. `list_custom_tools` shows what it has written. Deleting a tool from the file and calling `reload_tools` again removes it. Custom tools run with the same permissions as built-ins (they execute Python in this process), so read what it writes.
+
+```
+@tool("my_tool", "What it does, so the model knows when to use it.", {"name": str})
+async def my_tool(args):
+    return text(f"hello {args['name']}")
+```
+
+## Checking itself
+
+- **`self_check`** (voice: "run a self check") runs the test suite and reports pass/fail.
+- **`nightly_check.py`** does the same unattended and appends the result to `logs\nightly.log`. Register it once with Task Scheduler:
+  ```
+  Register-ScheduledTask -TaskName "Jarvis Nightly Check" `
+    -Action (New-ScheduledTaskAction -Execute ".\.venv\Scripts\python.exe" -Argument "nightly_check.py" -WorkingDirectory $PWD) `
+    -Trigger (New-ScheduledTaskTrigger -Daily -At 3:30AM)
+  ```
+- After any turn that changed the PC, the agent re-checks its own claim with a real tool before answering (`VERIFY_MAX_ROUNDS` in `config.py`).
+
 ## Tests
 
 ```
 .venv\Scripts\python test_brain.py      # agent loop against a fake model server, safety rules, yes/no parsing, workers, hotkeys
 .venv\Scripts\python test_time_tag.py   # the greeting time tags
-.venv\Scripts\python test_tools.py      # the newer tools: organize_folder, calendar_add, recall, find_duplicates, biggest_files, current_date
+.venv\Scripts\python test_tools.py      # the newer tools: organize_folder, calendar_add, recall/forget over facts and notes, hot-loading custom tools, find_duplicates, biggest_files, current_date
 .venv\Scripts\python test_voice.py "Good evening."   # writes logs\voice-kokoro.wav
+.venv\Scripts\python nightly_check.py   # all three suites plus a report line in logs\nightly.log
+.venv\Scripts\python bench.py 3         # real latency: model turn and tool timings
 ```
 
 `test_brain.py` and `test_time_tag.py` need no model, microphone or Windows.

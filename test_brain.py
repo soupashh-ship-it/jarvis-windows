@@ -38,6 +38,7 @@ REPLIES = [   # what the fake model says, request by request
         call(0, args='"description": "Say hi", "timeout": 5}')),
     sse(call(0, "c2", "run_command", '{"command": "Remove-Item C:\\\\x", "description": "Delete x", "timeout": 5}')),
     sse({"content": "All done, sir."}),
+    sse({"content": "VERIFIED"}),              # the check run: it confirms, so the answer above stands
 ]
 GEMINI = [    # recorded shape of Gemini's OpenAI-compatible stream: whole calls in one chunk, no index, id "0" twice
     sse({"role": "assistant", "tool_calls": [
@@ -46,6 +47,7 @@ GEMINI = [    # recorded shape of Gemini's OpenAI-compatible stream: whole calls
         {"id": "0", "type": "function",
          "function": {"name": "run_command", "arguments": '{"command": "echo b", "description": "b", "timeout": 5}'}}]}),
     sse({"content": ""}),
+    sse({"content": "VERIFIED"}),
     sse({"content": "Both done."}),
 ]
 seen = []
@@ -64,6 +66,8 @@ async def main():
     site = web.TCPSite(runner, "127.0.0.1", 0)
     await site.start()
     config.LLM_BASE_URL = f"http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}/v1"
+    config.LLM_PROVIDER = "http"      # never the live Antigravity CLI: these tests only talk to the fake server
+    config.SAFETY_GATE = True         # the gate rules are what's under test here (config_local turns it off)
 
     asked, spoken = [], []
 
@@ -88,17 +92,22 @@ async def main():
     assert calls[0]["extra_content"] == {"google": {"thought_signature": "sigA"}} and "extra_content" not in calls[1]
     assert len({c["id"] for c in calls}) == 2, calls                 # each call gets its own id...
     assert [m["tool_call_id"] for m in seen[1]["messages"] if m["role"] == "tool"] == [c["id"] for c in calls]
-    assert [m["content"] for m in seen[1]["messages"] if m["role"] == "tool"] == ["a", "b"]
+    assert [m["content"].split("\n")[-1] for m in seen[1]["messages"] if m["role"] == "tool"] == ["a", "b"]
     assert not [m for m in seen[2]["messages"] if m["role"] == "assistant" and not m.get("content")
                 and not m.get("tool_calls")]                         # ...and the empty reply is never sent back
     seen[:] = first
 
+    # a turn that changed the PC gets re-checked before its answer is spoken; the check itself is never spoken
+    assert len(seen) == 4, [len(r["messages"]) for r in seen]     # 3 replies + 1 verification round
+    assert config.VERIFY_PROMPT.split(" (round")[0] in seen[3]["messages"][-1]["content"]
+    assert "VERIFIED" not in " ".join(spoken), spoken
     assert spoken == ["Checking now.", "All done, sir."], spoken
     assert asked == ["Shall I run Remove-Item C:\\x (delete x)?"], asked   # echo ran unasked, Remove-Item was asked
     tool_msgs = [m for m in seen[1]["messages"] if m["role"] == "tool"]
-    assert tool_msgs == [{"role": "tool", "tool_call_id": "c1", "content": "hi"}], tool_msgs
+    assert [(m["tool_call_id"], m["content"].split("\n")[-1]) for m in tool_msgs] == [("c1", "hi")], tool_msgs
+    assert all(m["content"].startswith("[tool output") for m in tool_msgs), "tool output is labelled untrusted"
     assert json.loads(seen[1]["messages"][2]["tool_calls"][0]["function"]["arguments"])["command"] == "echo hi"
-    assert "said no" in seen[2]["messages"][-1]["content"]
+    assert "said no" in json.dumps(seen[2]["messages"])            # the refusal is still in the thread
     assert {t["function"]["name"] for t in seen[0]["tools"]} >= {"screenshot", "run_command", "start_worker"}
 
 
@@ -190,6 +199,57 @@ assert asyncio.run(w.permit("run_command", {"command": "del x", "description": "
 assert asked == ["Sir, the report worker would like to run del x (delete x). Shall I allow it?"] and w.state == "running"
 assert [worker.outcome(r, f) for r, f in (("Saved to notes.md", False), ("NEED USER: 2x or 4x?", False), ("", True))] \
     == ["done", "waiting", "failed"]
+
+# full access (SAFETY_GATE off, as in config_local) asks about nothing, but the gate still blocks unknown tools
+async def _no_gate_confirm(question, detail=""):
+    raise AssertionError("must not ask with the gate off: " + str(question))
+
+
+async def _gate_off():
+    config.SAFETY_GATE = False
+    try:
+        async def gate(name, data):                       # the same shape as Brain.gate, without a voice
+            return brain.policy(name, data) == "allow" or await _no_gate_confirm(name)
+        a = brain.Agent("p", gate, list(pctools.TOOLS.values()))
+        out = await a.call({"id": "x", "function": {"name": "run_command",
+                                                    "arguments": '{"command": "del x", "description": "d", "timeout": 5}'}})
+        assert "asked" not in json.dumps(out).lower(), out
+        gone = await a.call({"id": "y", "function": {"name": "no_such_tool", "arguments": "{}"}})
+        assert "no tool called" in json.dumps(gone).lower(), gone
+    finally:
+        config.SAFETY_GATE = True
+
+
+asyncio.run(_gate_off())
+
+# a tool the agent was built before can still be called if a plugin registered it since; wrong argument
+# names come back as a fixable message instead of a traceback
+async def _late_tool():
+    a = brain.Agent("p", _gate_allow, list(pctools.TOOLS.values()))
+    before = set(pctools.TOOLS)
+
+    @pctools.tool("late_test_tool", "Registered after the agent was built.", {"who": str})
+    async def _late(args):
+        return pctools.text("late ok: " + args["who"])
+
+    try:
+        out = await a.call({"id": "l1", "function": {"name": "late_test_tool", "arguments": '{"who": "me"}'}})
+        assert "late ok: me" in json.dumps(out), out
+        out = await a.call({"id": "l2", "function": {"name": "late_test_tool", "arguments": '{"name": "me"}'}})
+        assert "needs argument" in json.dumps(out), out
+        out = await a.call({"id": "l3", "function": {"name": "open_path", "arguments": '{"target": ""}'}})
+        assert "what to open" in json.dumps(out).lower(), out
+    finally:
+        for n in set(pctools.TOOLS) - before:
+            pctools.TOOLS.pop(n, None)
+            pctools._PLUGIN_TOOLS.discard(n)
+
+
+async def _gate_allow(name, data):
+    return "allow"
+
+
+asyncio.run(_late_tool())
 
 # Gemini rejects tools whose parameters have no properties
 assert all(t.spec["function"]["parameters"]["properties"] for t in pctools.TOOLS.values())

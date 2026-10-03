@@ -569,6 +569,12 @@ class Agent:
     def who(self):
         return f"the {self.name} worker" if self.sub else "Jarvis"
 
+    def live_tools(self):
+        """Built-ins from when this agent started, plus anything a plugin registered since (hot-loaded tools)."""
+        merged = dict(self.tools)
+        merged.update({n: f for n, f in pctools.TOOLS.items() if n not in merged})
+        return merged
+
     async def close(self):
         if self.antigravity:
             await self.antigravity.close()
@@ -578,9 +584,10 @@ class Agent:
             await self.antigravity.warm()
 
     async def complete(self, messages):
+        tools = list(self.live_tools().values())
         if self.antigravity:
-            return await self.antigravity.chat(messages, [f.spec for f in self.tools.values()], self.on_text)
-        return await chat(messages, [f.spec for f in self.tools.values()], self.on_text, self.model)
+            return await self.antigravity.chat(messages, [f.spec for f in tools], self.on_text)
+        return await chat(messages, [f.spec for f in tools], self.on_text, self.model)
 
     async def run(self, prompt):
         """One request: model, tools, model... until it answers without a tool. Returns its last words."""
@@ -594,6 +601,10 @@ class Agent:
     async def _run(self, prompt):
         self.messages.append({"role": "user", "content": prompt})
         self.steps = 0
+        pending = False     # this turn changed the PC, so its claims get re-checked before we answer
+        rounds = 0
+        answer = ""
+        spoke = self.on_text
         while self.steps < config.MAX_STEPS:
             self.trim()
             for attempt in (1, 2, 3):
@@ -616,10 +627,23 @@ class Agent:
             if self.on_text:
                 self.on_text("\n")                  # end of a message: speak whatever is left
             if not msg.get("tool_calls"):
-                if msg["content"]:                  # an empty reply isn't kept: Gemini rejects empty messages
+                say = msg["content"] or ""
+                if say:                            # an empty reply isn't kept: Gemini rejects empty messages
                     self.messages.append(msg)
-                return msg["content"] or ""
+                if pending and rounds < config.VERIFY_MAX_ROUNDS:
+                    rounds += 1
+                    log.info("verifying round %d before answering", rounds)
+                    events.emit("verify", round=rounds, sub=self.sub, agent=self.name)
+                    self.on_text = None              # checking is not worth narrating out loud
+                    self.messages.append({"role": "user", "content": f"{config.VERIFY_PROMPT} (round {rounds})"})
+                    answer = say
+                    pending = False
+                    continue
+                self.on_text = spoke
+                return answer if say.strip().upper().startswith("VERIFIED") else (say or answer)
             self.messages.append(msg)
+            if any(c["function"]["name"] in pctools.MUTATES for c in msg["tool_calls"]):
+                pending = True
             images, answered = [], set()
             try:
                 for call in msg["tool_calls"]:
@@ -641,10 +665,12 @@ class Agent:
             if images and config.LLM_VISION:        # most APIs only take images from the user, so hand them over
                 self.messages.append({"role": "user", "content": [{"type": "text", "text": "The screen from that step:"}] + [
                     {"type": "image_url", "image_url": {"url": f"data:{i['mimeType']};base64,{i['data']}"}} for i in images]})
+        self.on_text = spoke
         return "I've reached my step limit for this request."
 
     async def call(self, call):
         name, self.steps = call["function"]["name"], self.steps + 1
+        tools = self.live_tools()                    # hot-loaded tools count too, not just this agent's originals
         try:
             args = json.loads(call["function"]["arguments"] or "{}")
         except ValueError:
@@ -655,7 +681,7 @@ class Agent:
         error = True
         if not isinstance(args, dict):
             result = pctools.text(f"The arguments for {name} weren't valid JSON. Try again.")
-        elif name not in self.tools:
+        elif name not in tools:
             result = pctools.text(f"There is no tool called {name}.")
         elif name in pctools.DESKTOP and DESK["owner"] not in (None, self):
             # ponytail: the driver keeps the desktop for its whole request or job; upgrade path is an idle timeout
@@ -667,7 +693,13 @@ class Agent:
             if name in pctools.DESKTOP:
                 DESK["owner"] = self
             try:
-                result, error = await self.tools[name](args), False
+                result, error = await tools[name](args), False
+            except KeyError as e:
+                # the model keeps sending an argument under a different name; say so instead of crashing
+                log.warning("tool %s missing argument %s", name, e)
+                want = sorted(tools[name].spec["function"].get("parameters", {}).get("properties", {}))
+                result = pctools.text(f"{name} needs argument(s) {', '.join(want)}; you sent {sorted(args)}. "
+                                      f"Call it again with exactly those names.")
             except Exception as e:
                 log.exception("tool %s failed", name)
                 result = pctools.text(f"{name} failed: {e!r}")
