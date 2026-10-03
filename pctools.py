@@ -8,6 +8,7 @@ import contextvars
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -26,6 +27,7 @@ TYPES = {str: "string", int: "integer", bool: "boolean"}
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)          # Jarvis runs windowless; so must its commands
 PS_UTF8 = "[Console]::OutputEncoding = [Text.Encoding]::UTF8; "
 DESKTOP = {"open_app", "focus_window", "click_at", "move_mouse", "scroll", "type_text", "press_keys"}  # one agent at a time
+NOTIFY = None              # (message) -> None, speak a message later; set by jarvis.py
 
 
 def tool(name, description, params):
@@ -157,6 +159,538 @@ async def volume(args):
     elif action in ("mute", "unmute"):
         ev.SetMute(action == "mute", None)
     return text(f"Volume {round(ev.GetMasterVolumeLevelScalar() * 100)}%{', muted' if ev.GetMute() else ''}.")
+
+
+@tool("app_volume", "Set the output volume of one app, e.g. 'discord', 'spotify' (0-100). Use the task manager's "
+      "name if unsure. action: set, get. level only for set.", {"app": str, "action": str, "level": int})
+async def app_volume(args):
+    from pycaw.pycaw import AudioUtilities
+    app = args["app"].lower().rstrip(".exe")
+    action = args.get("action", "get").lower()
+    for s in AudioUtilities.GetAllSessions():
+        name = (s.Process.name() if s.Process else "") or ""
+        if app in name.lower():
+            vol = s.SimpleAudioVolume
+            if action == "set":
+                vol.SetMasterVolume(max(0, min(100, args.get("level", 50))) / 100, None)
+            return text(f"{name} volume {round(vol.GetMasterVolume() * 100)}%.")
+    return text(f"No audio session matches '{args['app']}'. Is it playing sound right now?")
+
+
+# ---------- screen text (OCR) ----------
+
+@tool("read_screen_text", "Read the text that's on the screen right now (OCR): an error message, a code, a label. "
+      "target: 'window' (active window), 'left' or 'right' (one monitor) or 'both'. Returns the detected lines.",
+      {"target": str})
+async def read_screen_text(args):
+    import winocr                      # pip install winocr: Windows' built-in OCR engine
+
+    with mss.mss() as sct:
+        monitors = sorted(sct.monitors[1:], key=lambda m: m["left"])
+        region = sct.monitors[0]
+        target = args.get("target", "both")
+        if target in ("left", "right"):
+            region = monitors[0] if target == "left" else monitors[-1]
+        elif target == "window":
+            w = winapi.active_window()
+            if w and w["w"] > 0 and w["h"] > 0 and not w["minimized"]:
+                region = {"left": w["x"], "top": w["y"], "width": w["w"], "height": w["h"]}
+        shot = sct.grab(region)
+    img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+
+    def run():
+        out = winocr.recognize_pil_sync(img)
+        return [l["text"] for l in out.get("lines", []) if l.get("text", "").strip()]
+
+    lines = await asyncio.to_thread(run)
+    if not lines:
+        return text("No readable text found on that part of the screen.")
+    joined = "\n".join(lines)
+    return text(joined[:4000] + ("\n(truncated)" if len(joined) > 4000 else ""))
+
+
+# ---------- file tidying ----------
+
+_KINDS = {"Images": {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".svg", ".ico"},
+          "Videos": {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"},
+          "Audio": {".mp3", ".wav", ".flac", ".m4a", ".ogg", ".aac"},
+          "Documents": {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".txt", ".md", ".csv", ".rtf", ".odt"},
+          "Archives": {".zip", ".rar", ".7z", ".tar", ".gz", ".bz2"},
+          "Code": {".py", ".js", ".ts", ".html", ".css", ".json", ".yaml", ".yml", ".xml", ".cs", ".java", ".cpp", ".c", ".h", ".go", ".rs", ".sh", ".ps1", ".sql"},
+          "Apps": {".exe", ".msi", ".lnk", ".bat", ".cmd"}}
+
+
+def _category(name):
+    ext = os.path.splitext(name)[1].lower()
+    return next((k for k, exts in _KINDS.items() if ext in exts), None)
+
+
+@tool("organize_folder", "Tidy a folder: move its files into subfolders by type (Images, Documents, Archives, "
+      "Code, Apps...). path: which folder ('Downloads', 'Desktop', or a full folder). dry_run: true to only preview "
+      "what would move, false to actually move.", {"path": str, "dry_run": bool})
+async def organize_folder(args):
+    target = args.get("path", "Downloads")
+    target = os.path.expanduser(os.path.join(config.HOME, target) if target in ("Downloads", "Desktop", "Documents") else target)
+    if not os.path.isdir(target):
+        return text(f"No folder at {target}.")
+    plan, seen = [], set()
+    for dirpath, dirnames, filenames in os.walk(target):
+        for f in sorted(filenames):
+            if f.startswith("."):
+                continue
+            src = os.path.join(dirpath, f)
+            if not os.path.isfile(src) or src in seen:
+                continue
+            kind = _category(f) or "Other"
+            dst_dir = os.path.join(target, kind)
+            if os.path.abspath(dirpath) == os.path.abspath(dst_dir):
+                continue              # already filed in its own category folder
+            seen.add(src)
+            dst = os.path.join(dst_dir, f)
+            n = 2
+            while os.path.exists(dst) and os.path.abspath(dst) != os.path.abspath(src):
+                stem, ext = os.path.splitext(f)
+                dst = os.path.join(dst_dir, f"{stem} ({n}){ext}")
+                n += 1
+            plan.append((src, dst_dir, dst))
+    if not plan:
+        return text(f"{target} is already tidy — no loose files.")
+    lines = [f"Would move {len(plan)} file(s) in {target}:"]
+    for src, dst_dir, dst in plan[:25]:
+        lines.append(f"  {os.path.basename(src)} -> {os.path.basename(dst_dir)}\\")
+    if len(plan) > 25:
+        lines.append(f"  ...and {len(plan) - 25} more")
+    if args.get("dry_run", True):
+        return text("\n".join(lines) + "\nSay 'do it' (dry_run=false) to apply.")
+    import shutil
+    for src, dst_dir, dst in plan:
+        os.makedirs(dst_dir, exist_ok=True)
+        shutil.move(src, dst)
+    return text("\n".join(lines[:5]) + f"\nDone — moved {len(plan)} file(s)." if len(lines) > 5 else "\n".join(lines))
+
+
+@tool("find_duplicates", "Find files with the same content inside a folder (exact copies, any name). Returns "
+      "groups with full paths. folder: 'Downloads', 'Desktop', or a full path.", {"folder": str})
+async def find_duplicates(args):
+    def run():
+        import hashlib
+        root = args.get("folder", "Downloads")
+        root = os.path.expanduser(os.path.join(config.HOME, root) if root in ("Downloads", "Desktop", "Documents") else root)
+        by_size = {}
+        for dirpath, dirnames, filenames in os.walk(root):
+            for f in filenames:
+                p = os.path.join(dirpath, f)
+                try:
+                    by_size.setdefault(os.path.getsize(p), []).append(p)
+                except OSError:
+                    pass
+        groups = {}
+        for size, paths in by_size.items():
+            if len(paths) < 2 or size == 0:
+                continue
+            for p in paths:
+                h = hashlib.sha256()
+                try:
+                    with open(p, "rb") as f:
+                        for chunk in iter(lambda: f.read(1 << 20), b""):
+                            h.update(chunk)
+                    groups.setdefault((size, h.hexdigest()), []).append(p)
+                except OSError:
+                    pass
+        return [ps for ps in groups.values() if len(ps) > 1], root
+    groups, root = await asyncio.to_thread(run)
+    if not groups:
+        return text(f"No exact duplicates found in {root}.")
+    out = [f"{len(groups)} duplicate group(s) in {root}:"]
+    for ps in groups[:10]:
+        out.append(f"  {len(ps)}x, {os.path.getsize(ps[0]) // 1024} KB:")
+        out += [f"    {p}" for p in ps[:4]]
+    return text("\n".join(out))
+
+
+@tool("biggest_files", "List the biggest files in a folder. folder: 'Downloads', 'Desktop', 'Documents', or a full "
+      "path. count: how many to list (default 10).", {"folder": str, "count": int})
+async def biggest_files(args):
+    def run():
+        root = args.get("folder", "Downloads")
+        root = os.path.expanduser(os.path.join(config.HOME, root) if root in ("Downloads", "Desktop", "Documents") else root)
+        out = []
+        for dirpath, dirnames, filenames in os.walk(root):
+            for f in filenames:
+                p = os.path.join(dirpath, f)
+                try:
+                    out.append((os.path.getsize(p), p))
+                except OSError:
+                    pass
+        return sorted(out, reverse=True)[:max(1, min(50, int(args.get("count", 10))))]
+    rows = await asyncio.to_thread(run)
+    return text("\n".join(f"{s / 1e6:.1f} MB  {p}" for s, p in rows) if rows else "Nothing found.")
+
+
+# ---------- timers ----------
+
+_TIMERS = {}                      # label -> asyncio.Task
+
+
+@tool("set_timer", "Start a countdown timer. When it finishes Jarvis tells you. seconds: how long. label: what for.",
+      {"seconds": int, "label": str})
+async def set_timer(args):
+    seconds = max(1, min(86400, int(args["seconds"])))
+    label = args.get("label", "").strip() or "timer"
+    old = _TIMERS.pop(label, None)
+    if old:
+        old.cancel()
+
+    async def wait():
+        try:
+            await asyncio.sleep(seconds)
+            events.emit("timer", label=label, seconds=seconds)
+            if NOTIFY:
+                NOTIFY(f"[timer, not from {config.USER_NAME}] The {label} timer ({seconds} s) has finished. Tell the user it's done.")
+        except asyncio.CancelledError:
+            pass
+        finally:
+            _TIMERS.pop(label, None)
+
+    _TIMERS[label] = asyncio.create_task(wait())
+    return text(f"Timer '{label}' set for {seconds} seconds.")
+
+
+@tool("list_timers", "Show the countdown timers that are still running.", {})
+async def list_timers(args):
+    if not _TIMERS:
+        return text("No timers running.")
+    return text("Running timers: " + ", ".join(_TIMERS))
+
+
+@tool("cancel_timer", "Cancel a running timer by its label.", {"label": str})
+async def cancel_timer(args):
+    t = _TIMERS.pop(args.get("label", ""), None)
+    if t is None:
+        return text(f"No timer named '{args.get('label')}'.")
+    t.cancel()
+    return text(f"Cancelled '{args['label']}'.")
+
+
+# ---------- UI-Automation clicking ----------
+
+@tool("ui_click", "Click a button/link/menu item by its visible text, using Windows UI Automation instead of "
+      "pixel coordinates. More reliable than click_at. text: the label, e.g. 'Send', 'Save', 'Download'.",
+      {"text": str})
+async def ui_click(args):
+    needle = args["text"].strip().lower()
+    if not needle:
+        return text("Tell me what to click (the button's visible text).")
+    def run():
+        from pywinauto import Desktop
+        active = winapi.active_window() or {}
+        roots = []
+        if active.get("title"):
+            try:
+                roots = [Desktop(backend="uia").window(title_re=f".*{re.escape(active['title'][:40])}.*")]
+            except Exception:
+                pass
+        roots.append(Desktop(backend="uia"))
+        for root in roots:
+            try:
+                for el in root.descendants():
+                    try:
+                        if needle in (el.window_text() or "").lower():
+                            el.click_input()
+                            return el.window_text()
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+        return None
+    try:
+        hit = await asyncio.to_thread(run)
+    except Exception as e:
+        return text(f"UI click failed: {e}")
+    return text(f"Clicked '{hit}'." if hit else f"No visible control matching '{args['text']}' in the active window.")
+
+
+# ---------- browser automation ----------
+
+@tool("web_browse", "Drive a real browser: open a URL (or search the web when given query instead), then optionally "
+      "click a link/button by its text. Returns the page title and a trimmed text of the page.",
+      {"url": str, "query": str, "click": str})
+async def web_browse(args):
+    def run():
+        from playwright.sync_api import sync_playwright
+        import urllib.parse as up
+        url = args.get("url", "").strip()
+        query = args.get("query", "").strip()
+        click = args.get("click", "").strip()
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            try:
+                page = browser.new_page()
+                target = url or ("https://www.bing.com/search?q=" + up.quote_plus(query))
+                page.goto(target, timeout=30000, wait_until="domcontentloaded")
+                if click:
+                    page.get_by_text(click, exact=False).first.click(timeout=8000)
+                    page.wait_for_load_state("domcontentloaded", timeout=15000)
+                title = page.title()
+                body = page.inner_text("body")[:3000]
+                return f"{title}\n{page.url}\n\n{body}"
+            finally:
+                browser.close()
+    try:
+        out = await asyncio.to_thread(run)
+    except Exception as e:
+        return text(f"Browser failed: {e}")
+    return text(out or "(empty page)")
+
+
+@tool("current_date", "What today is (day, date, time, local). Use it before answering anything time-sensitive: news, "
+      "weather, 'latest', 'current'.", {})
+async def current_date(args):
+    import datetime
+    now = datetime.datetime.now().astimezone()
+    return text(now.strftime("%A, %d %B %Y, %H:%M %Z%z").replace("  ", " "))
+
+
+# ---------- quick system info ----------
+
+@tool("system_info", "Read this PC's vitals: CPU load, memory, disk free, battery.", {})
+async def system_info(args):
+    def run():
+        cpu = psutil.cpu_percent(interval=0.6)
+        mem = psutil.virtual_memory()
+        disk = psutil.disk_usage(config.HOME[:3] if os.name == "nt" else "/")
+        battery = psutil.sensors_battery()
+        parts = [f"CPU {cpu}%", f"RAM {round(mem.used / mem.total * 100)}% ({round(mem.available / 1e9, 1)} GB free of {round(mem.total / 1e9)} GB)",
+                 f"Disk {round(disk.free / 1e9)} GB free on {os.path.splitdrive(config.HOME)[0] or 'C:'}"]
+        if battery:
+            parts.append(f"Battery {round(battery.percent)}%{', on power' if battery.power_plugged else ''}")
+        return parts
+    parts = await asyncio.to_thread(run)
+    return text(". ".join(parts) + ".")
+
+
+@tool("weather_now", "Current weather for Ash's city (config CITY), from wttr.in.", {})
+async def weather_now(args):
+    import urllib.request
+    def run():
+        url = f"https://wttr.in/{config.CITY}?format=j1"
+        req = urllib.request.Request(url, headers={"User-Agent": "curl"})
+        data = json.loads(urllib.request.urlopen(req, timeout=20).read())
+        cur = data["current_condition"][0]
+        loc = data["nearest_area"][0]["areaName"][0]["value"]
+        line = (f"{loc}: {cur['weatherDesc'][0]['value']}, {cur['temp_C']}\u00b0C, feels like {cur['FeelsLikeC']}\u00b0C, "
+                f"wind {cur['windspeedKmph']} km/h, humidity {cur['humidity']}%.")
+        days = data.get("weather", [])
+        if len(days) >= 2:
+            tmr = days[1]
+            tmr_desc = (tmr.get("hourly") or [{}])[4].get("weatherDesc", [{}])[0].get("value", "?")
+            line += f" Tomorrow: {tmr_desc}, {tmr.get('mintempC')} to {tmr.get('maxtempC')}\u00b0C."
+        return line
+    try:
+        return text(await asyncio.to_thread(run))
+    except Exception as e:
+        return text(f"Couldn't get the weather: {e}")
+
+
+@tool("clipboard", "The clipboard: action 'read' to see what you copied, 'write' to put text on it. text only for write.",
+      {"action": str, "text": str})
+async def clipboard(args):
+    action = args.get("action", "read").lower()
+    def run():
+        if action == "write":
+            proc = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                                   "[Console]::InputEncoding=[Text.Encoding]::UTF8; Set-Clipboard -Value ([Console]::In.ReadToEnd())"],
+                                  input=args.get("text", ""), text=True, encoding="utf-8", capture_output=True, timeout=20,
+                                  creationflags=NO_WINDOW)
+            return "" if proc.returncode == 0 else (proc.stderr or "clipboard write failed")
+        return subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", "Get-Clipboard"],
+                              text=True, encoding="utf-8", errors="replace", capture_output=True, timeout=20,
+                              creationflags=NO_WINDOW).stdout
+    try:
+        out = await asyncio.to_thread(run)
+    except Exception as e:
+        return text(f"Clipboard failed: {e}")
+    if action == "write":
+        return text("Clipboard updated." if not out else f"Couldn't copy: {out}")
+    return text(out.strip() if out.strip() else "The clipboard is empty (or holds no text).")
+
+
+# ---------- calendar ----------
+
+@tool("calendar_add", "Create a calendar event as an .ics file in ~/calendar and open it (Outlook imports it). "
+      "title: event name. start: 'YYYY-MM-DD HH:MM' or 'YYYY-MM-DDTHH:MM'. duration_minutes: default 30.",
+      {"title": str, "start": str, "duration_minutes": int})
+async def calendar_add(args):
+    import datetime, re as _re
+    start = None
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%d %B %Y %H:%M", "%d/%m/%Y %H:%M"):
+        try:
+            start = datetime.datetime.strptime(args["start"].strip(), fmt)
+            break
+        except ValueError:
+            continue
+    if start is None:
+        try:
+            start = datetime.datetime.fromisoformat(args["start"].replace("Z", ""))
+        except Exception:
+            return text(f"Couldn't read the start time '{args['start']}' — use 'YYYY-MM-DD HH:MM'.")
+    end = start + datetime.timedelta(minutes=max(5, min(1440, int(args.get("duration_minutes", 30)))))
+    os.makedirs(os.path.join(config.HOME, "calendar"), exist_ok=True)
+    fname = _re.sub(r"[^\w -]", "", args["title"]).strip().replace(" ", "_") + ".ics"
+    path = os.path.join(config.HOME, "calendar", fname)
+    stamp = lambda d: d.strftime("%Y%m%dT%H%M%S")
+    body = (f"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:{int(time.time())}@jarvis\r\n"
+            f"DTSTAMP:{stamp(datetime.datetime.utcnow())}\r\nDTSTART:{stamp(start)}\r\nDTEND:{stamp(end)}\r\n"
+            f"SUMMARY:{args['title']}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n")
+    with open(path, "w", encoding="utf-8", newline="\r\n") as f:
+        f.write(body)
+    try:
+        os.startfile(path)
+    except OSError:
+        pass
+    return text(f"Calendar event '{args['title']}' for {start:%A %d %B, %H:%M}; saved to {path} and opened for import.")
+
+
+@tool("list_emails", "Show recent emails from Outlook (if installed): subject, sender, received time. count: how many (default 5).",
+      {"count": int})
+async def list_emails(args):
+    def run():
+        import subprocess
+        n = max(1, min(20, int(args.get("count", 5))))
+        cmd = ("$ol = New-Object -ComObject Outlook.Application; $ns = $ol.GetNamespace('MAPI'); "
+               "$inbox = $ns.GetDefaultFolder(6); $items = $inbox.Items | Sort-Object ReceivedTime -Descending | "
+               f"Select-Object -First {n}; $items | ForEach-Object {{ \"$($_.ReceivedTime.ToString('dd MMM HH:mm')) | $($_.SenderName) | $($_.Subject)\" }}")
+        proc = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
+                              text=True, encoding="utf-8", errors="replace", capture_output=True, timeout=60,
+                              creationflags=NO_WINDOW)
+        return proc.stdout.strip() or proc.stderr.strip()
+    try:
+        out = await asyncio.to_thread(run)
+    except Exception as e:
+        return text(f"Couldn't read Outlook: {e}. Is Outlook installed and signed in?")
+    return text(out[:3000] if out else "No emails found or Outlook isn't available.")
+
+
+@tool("self_check", "Run the project's built-in checks (agent loop, safety rules, yes/no parsing, workers, time "
+      "tags) and report the result. Run it if you suspect something's off.", {})
+async def self_check(args):
+    def run():
+        out = []
+        for script in ("test_brain.py", "test_time_tag.py", "test_tools.py"):
+            r = subprocess.run([sys.executable, os.path.join(config.JARVIS_DIR, script)],
+                               capture_output=True, text=True, timeout=180, cwd=config.JARVIS_DIR,
+                               creationflags=NO_WINDOW)
+            last = (r.stdout.strip().splitlines() or [""])[-1]
+            out.append(f"{script}: exit {r.returncode} — {last}")
+        return out
+    out = await asyncio.to_thread(run)
+    return text("\n".join(out))
+
+
+# ---------- everyday info ----------
+
+@tool("find_file", "Find a file by name (or part of its name/extension) in your home, Desktop, Documents and "
+      "Downloads. Returns full paths, best 15 matches.", {"name": str})
+async def find_file(args):
+    def run():
+        roots = [os.path.expanduser(p) for p in ("~", "~\\Desktop", "~\\Documents", "~\\Downloads")]
+        skip = {".git", "node_modules", "AppData", "__pycache__", ".venv", "windows", "logs"}
+        hits, needle = [], args["name"].lower()
+        for root in dict.fromkeys(roots):
+            for dirpath, dirnames, filenames in os.walk(root):
+                dirnames[:] = [d for d in dirnames if d not in skip and not d.startswith(".")]
+                if dirpath.count(os.sep) - root.count(os.sep) > 4:
+                    dirnames[:] = []
+                    continue
+                for f in filenames:
+                    if needle in f.lower():
+                        hits.append(os.path.join(dirpath, f))
+                        if len(hits) >= 15:
+                            return hits
+        return hits
+    hits = await asyncio.to_thread(run)
+    return text("\n".join(hits) if hits else f"Nothing found matching '{args['name']}'.")
+
+
+@tool("web_search", "Search the web and get the top results (title, a short snippet, the link). Use it for "
+      "facts, news, 'how do I...' questions.", {"query": str})
+async def web_search(args):
+    import html
+    import urllib.parse
+    import urllib.request
+
+    def run():
+        import base64, html, urllib.parse as up, urllib.request
+        url = "https://www.bing.com/search?q=" + up.quote_plus(args["query"])
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        page = urllib.request.urlopen(req, timeout=20).read().decode("utf-8", "replace")
+        out = []
+        for m in re.finditer(r'<li class="b_algo"[^>]*>(.*?)(?=<li class="b_algo"|</ol>)', page, re.S):
+            block = m.group(1)
+            t = re.search(r'<h2[^>]*><a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', block, re.S)
+            sn = re.search(r'<p[^>]*>(.*?)</p>', block, re.S)
+            if not t:
+                continue
+            link, title = t.group(1), html.unescape(re.sub("<.*?>", "", t.group(2)))
+            if "bing.com/ck/a" in link:                          # Bing wraps results in a redirect; unwrap it
+                u = up.parse_qs(up.urlparse(link.replace("&amp;", "&")).query).get("u", [""])[0]
+                if u.startswith("a1"):
+                    try:
+                        link = base64.urlsafe_b64decode(u[2:] + "=" * (-len(u[2:]) % 4)).decode()
+                    except Exception:
+                        pass
+            snip = html.unescape(re.sub("<.*?>", "", sn.group(1))) if sn else ""
+            out.append(f"{title.strip()}\n{snip.strip()}\n{link}")
+        return out
+    try:
+        out = await asyncio.to_thread(run)
+    except Exception as e:
+        return text(f"Search failed: {e}")
+    return text("\n\n".join(out) if out else "No results.")
+
+
+_FACTS_FILE = os.path.join(config.JARVIS_DIR, "facts.md")
+
+
+@tool("remember", "Write down a durable fact about the user or their PC (name spelling, a project, a "
+      "preference). It is kept forever and shown to every future session.", {"fact": str})
+async def remember(args):
+    stamp = time.strftime("%Y-%m-%d %H:%M")
+    with open(_FACTS_FILE, "a", encoding="utf-8") as f:
+        f.write(f"- {args['fact'].strip()} ({stamp})\n")
+    return text(f"Noted: {args['fact'].strip()}")
+
+
+@tool("recall", "Read back the durable facts Jarvis has been told (remember tool), best matches first. Optional query "
+      "filters/reranks.", {"query": str})
+async def recall(args):
+    try:
+        with open(_FACTS_FILE, encoding="utf-8") as f:
+            lines = [l.strip() for l in f.read().splitlines() if l.strip().startswith("-")]
+    except FileNotFoundError:
+        return text("Nothing remembered yet.")
+    query = args.get("query", "").lower().strip()
+    if not query:
+        return text("\n".join(lines) if lines else "No matching facts.")
+    # rank by a tiny TF-IDF cosine, so "what's my project name" finds a fact about the project
+    import math
+    def tokens(s):
+        return set(re.findall(r"[a-z0-9']+", s.lower()))
+    docs, idf = [], {}
+    for l in lines:
+        ts = tokens(l)
+        docs.append((l, ts))
+        for t in ts:
+            idf[t] = idf.get(t, 0) + 1
+    q = tokens(query)
+    scored = []
+    for i, (l, ts) in enumerate(docs):
+        if not q & ts:
+            continue
+        score = sum(1 / math.log(1 + idf[t]) for t in (q & ts)) / math.sqrt(len(ts) + 1)
+        scored.append((score, i, l))
+    scored.sort(reverse=True)
+    return text("\n".join(l for _, _, l in scored[:8]) if scored else "No matching facts.")
 
 
 # ---------- windows, screen, mouse, keyboard ----------
@@ -411,4 +945,10 @@ async def write_file(args):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         f.write(args["content"])
-    return text(f"Wrote {len(args['content'])} characters to {path}.")
+        return text(f"Wrote {len(args['content'])} characters to {path}.")
+
+
+try:                                     # Jarvis can extend itself: custom_tools.py is picked up at startup
+    import custom_tools  # noqa: F401
+except ImportError:
+    pass

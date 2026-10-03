@@ -16,13 +16,17 @@ CITY = "London"            # for the weather line in the morning greeting (wttr.
 # Folders Jarvis may write to without asking (plus your home folder)
 WRITE_OK_DIRS = []
 
+# Safety gate: when True, risky actions (deletes, downloads, system changes...) ask out loud first.
+# When False, everything runs immediately — full access, no spoken yes/no.
+SAFETY_GATE = True
+
 # Brain: the official Antigravity CLI uses the Google account you sign in with (no API key).
 # Set LLM_PROVIDER to "openai-compatible" to use Ollama or another compatible endpoint instead.
 LLM_PROVIDER = "antigravity"
 ANTIGRAVITY_CLI = os.environ.get("JARVIS_ANTIGRAVITY_CLI", "")  # optional path when agy isn't on PATH
 LLM_BASE_URL = "http://localhost:11434/v1"
 LLM_API_KEY = os.environ.get("JARVIS_LLM_API_KEY", "")   # or set it in config_local.py
-LLM_MODEL = "gemini-3.8-flash-medium"
+LLM_MODEL = "gemini-3.8-flash-high"
 LLM_VISION = True          # False if the model can't read images (Jarvis then can't look at screenshots)
 WORKER_MODEL = ""          # optional model for background workers; "" = same as LLM_MODEL
 MAX_STEPS = 30             # tool calls per request before Jarvis gives up
@@ -35,10 +39,12 @@ MIC_DEVICE = None          # None = system default input, or a device name/numbe
 WAKE_THRESHOLD = 0.5       # raise if it wakes by itself, lower if it misses you
 WAKE_MIN_RMS = 80          # minimum recent PCM RMS for a wake; filters model spikes on digital silence
 WAKE_VAD_THRESHOLD = 0.2   # OpenWakeWord's speech-activity gate; rejects wake scores on non-speech noise
+WAKE_WORD_MODELS = ["hey_jarvis_v0.1.onnx"]  # OpenWakeWord models to listen for (in order). No official hey_samantha model exists;
+                                               # drop a custom hey_samantha.onnx into models/ and add its filename here to wake on it.
 WAIT_FOR_SPEECH_S = 6.0    # after "hey jarvis", how long to wait for you to start talking
 END_SILENCE_S = 1.6        # this much silence = you've finished talking (lower values cut people off mid-thought)
 MAX_UTTERANCE_S = 45.0
-FOLLOW_UP_S = 5.0          # after Jarvis answers, listen this long without needing the wake word
+FOLLOW_UP_S = 10.0         # after Jarvis answers, listen this long without needing the wake word
 CONFIRM_WAIT_S = 8.0       # how long to wait for "yes" on a confirmation
 BARGE_IN_BY_VOICE = True   # talk over him to cut him off (needs headphones; set False if he interrupts himself)
 STT_ENGINE = "whisper"     # "whisper" (local faster-whisper) or "openai" (any OpenAI-compatible /audio/transcriptions)
@@ -47,7 +53,7 @@ STT_BASE_URL = "https://api.openai.com/v1"   # only for STT_ENGINE = "openai"
 STT_API_KEY = os.environ.get("JARVIS_STT_API_KEY", "")
 STT_MODEL = "whisper-1"
 # Names and jargon whisper should expect. Add your own names, places and apps it keeps mishearing.
-VOCAB = "Jarvis, Spotify, Discord, OBS, Steam, Explorer, Notepad, Chrome, Edge, Outlook."
+VOCAB = "Samantha, Jarvis, Spotify, Discord, OBS, Steam, Explorer, Notepad, Chrome, Edge, Outlook."
 
 # Hotkeys (Windows RegisterHotKey). Leave "" to turn one off.
 HOTKEY_LISTEN = "win+j"         # same as saying "hey jarvis"
@@ -57,7 +63,7 @@ HOTKEY_STOP = "win+shift+j"     # shut up / cancel
 VOICE_ENGINE = "kokoro"    # "kokoro" (local, works out of the box), "piper" (your own Piper voice, PIPER_MODEL)
                            # or "openai" (any OpenAI-compatible /audio/speech that can return pcm)
 PIPER_MODEL = ""           # path to a Piper .onnx voice; its .onnx.json must sit next to it
-VOICE = "bm_lewis"         # Kokoro voice: try bm_george, bm_daniel, bm_fable (for "openai": that service's voice name)
+VOICE = "af_aoede"         # Samantha's Kokoro voice (from goncaloneves/samantha profile); try bm_lewis (Jarvis), bm_george, bm_daniel (for "openai": that service's voice name)
 SPEED = 1.05
 KOKORO_MODEL = os.path.join(JARVIS_DIR, "models", "kokoro-v1.0.onnx")
 KOKORO_VOICES = os.path.join(JARVIS_DIR, "models", "voices-v1.0.bin")

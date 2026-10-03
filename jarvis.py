@@ -6,10 +6,12 @@ Dashboard:  http://127.0.0.1:8765
 """
 import asyncio
 import collections
+import difflib
 import json
 import logging
 import logging.handlers
 import os
+import random
 import re
 import signal
 import sys
@@ -28,6 +30,7 @@ import numpy as np  # noqa: E402
 import config
 import dashboard
 import events
+import pctools
 import winapi
 import worker
 from brain import Brain, approved, read_notes, read_state, summarize, write_state
@@ -37,7 +40,40 @@ from mouth import Mouth
 IDLE, LISTEN, BUSY = "idle", "listening", "busy"
 NEW_SESSION = re.compile(r"^\W*(please\W+)?(start\W+)?(a\W+)?(new|fresh)\W+(session|chat|conversation|start)\W*(please)?\W*$"
                          r"|^\W*fresh start\W*$", re.I)
-WAKE_PHRASE = re.compile(r"^\s*hey[\s,.;:-]+jarvis\b[\s,.:;!?-]*(.*)$", re.I)
+WAKE_PHRASE = re.compile(r"^\s*(?:hey[\s,.;:-]+)?(?:jarvis|samantha)\b[\s,.:;!?-]*(.*)$", re.I)
+STOP_PHRASE = re.compile(r"^\s*(?:hey\s+)?(?:jarvis|samantha)?\s*[,:;-]?\s*(?:stop|shut up|be quiet|cancel)\s*[.!]?\s*$", re.I)
+# Whisper mishears the name often ("Darius" is in our own log for "Hey Jarvis"), so the
+# idle fallback also accepts close variants. Exact "jarvis"/"samantha" only counts at the
+# start or after a greeting ("I told Jarvis..." must not wake); misheard variants only
+# at the very start, where the wake phrase lives.
+_WAKE_GREET = {"hey", "hi", "hello", "ok", "okay", "yo", "ah", "oh", "uh", "er"}
+_WAKE_NAMES = ("jarvis", "samantha")
+_WAKE_ALIAS = {"sam", "darius", "darvis", "darvus", "jarvas", "jarvice", "jarv", "jervis", "sarvis",
+               "samanth", "samanta", "samanthia", "samansa"}
+
+
+def wake_command(text):
+    """(matched, command) for a possibly-misheard spoken wake phrase at the start of text."""
+    if not text:
+        return False, ""
+    m = WAKE_PHRASE.match(text)
+    if m:
+        return True, m.group(1).strip()
+    toks = [(g.group(0), g.start(), g.end()) for g in re.finditer(r"[A-Za-z']+", text)]
+    if not toks:
+        return False, ""
+    words = [t[0].lower() for t in toks]
+    for i, w in enumerate(words[:3]):
+        if w in _WAKE_GREET:
+            continue
+        exact = w in _WAKE_NAMES
+        alias = w in _WAKE_ALIAS or bool(difflib.get_close_matches(w, list(_WAKE_NAMES), n=1, cutoff=0.78))
+        if exact and (i == 0 or words[0] in _WAKE_GREET):
+            return True, text[toks[i][2]:].lstrip(" ,.:;!?-").strip()
+        if alias and i <= 1:
+            return True, text[toks[i][2]:].lstrip(" ,.:;!?-").strip()
+        break
+    return False, ""
 IDLE_WAKE_END_BLOCKS = 8                    # tolerate the pause between "Hey" and "Jarvis"
 IDLE_WAKE_PREROLL_BLOCKS = 8                # retain 640 ms before VAD opens, including soft consonants
 IDLE_WAKE_MIN_RMS = 32                       # lower than the OpenWakeWord gate for ordinary speech
@@ -62,8 +98,14 @@ log = logging.getLogger("jarvis")
 STEP_WORDS = {"screenshot": "Looking at the screen", "click_at": "Clicking", "move_mouse": "Moving the mouse",
               "scroll": "Scrolling", "type_text": "Typing", "press_keys": "Pressing keys", "open_app": "Opening an app",
               "focus_window": "Switching windows", "list_windows": "Checking windows", "media": "Media controls",
-              "volume": "Volume", "run_command": "Command", "write_file": "Writing", "start_worker": "Starting a worker",
-              "annotate": "Pointing on screen"}
+              "volume": "Volume", "run_command": "Command",               "write_file": "Writing", "start_worker": "Starting a worker",
+              "annotate": "Pointing on screen",               "set_timer": "Setting a timer", "list_timers": "Timers",
+              "cancel_timer": "Cancelling a timer", "app_volume": "App volume", "find_file": "Finding a file",
+              "organize_folder": "Tidying files", "find_duplicates": "Finding duplicates", "biggest_files": "Checking file sizes",
+              "system_info": "Checking the PC", "weather_now": "Checking the weather", "clipboard": "Clipboard",
+              "ui_click": "Clicking a button", "web_browse": "Browsing the web",
+              "web_search": "Searching the web", "remember": "Remembering", "recall": "Recall",
+              "read_screen_text": "Reading the screen"}
 
 
 def step_words(ev):
@@ -105,6 +147,7 @@ class Jarvis:
         self.confirm_lock = asyncio.Lock()     # one spoken yes/no at a time (Jarvis and workers share it)
         worker.confirm = self.confirm
         worker.notify = lambda message: self.inbox.put_nowait(("worker", message))
+        pctools.NOTIFY = worker.notify      # timers and friends announce themselves the same way
         self.last_activity = time.time()
         self.resetting = False
         self.listen_id = 0
@@ -255,16 +298,15 @@ class Jarvis:
     async def check_idle_wake_phrase(self, audio):
         try:
             text = await self.ears.partial(audio)
-            match = WAKE_PHRASE.match(text or "")
-            if not match:
-                log.info("local wake fallback found no Hey Jarvis phrase in %.2f s of speech",
-                         len(audio) / RATE)
+            matched, command = wake_command(text or "")
+            if not matched:
+                log.info("local wake fallback found no Hey Jarvis/Samantha phrase in %.2f s of speech: %r",
+                         len(audio) / RATE, (text or "")[:100])
                 return
             if self.state != IDLE or self.processing or self.mouth.busy:
                 return
-            command = match.group(1).strip()
-            log.info("local speech fallback recognized Hey Jarvis%s",
-                     " followed by a command" if command else "")
+            log.info("local speech fallback recognized Hey Jarvis/Samantha%s: %r",
+                     " followed by a command" if command else "", (text or "")[:100])
             await self.wake(how="local speech fallback", command=command or None)
         except Exception:
             log.exception("local wake phrase fallback failed")
@@ -372,10 +414,18 @@ class Jarvis:
         log.info("heard: %s", text or "(nothing)")
         events.emit("heard", text=text, confirm=bool(target), listen_id=self.listen_id, seconds=round(len(audio) / 16000, 1),
                     stt_s=round(time.time() - t, 2))
+        if not target and text and STOP_PHRASE.match(text):         # a spoken "stop" cancels him, like the hotkey
+            log.info("voice stop: %s", text)
+            events.emit("stopped_by_user", how="voice")
+            await self.command("stop")
+            return
         if target:
             if not target.done():
                 target.set_result(text)
         elif text:
+            if self.processing:       # talking while he thinks steers him: stop the in-flight turn, take the new one
+                log.info("steering: interrupting the in-flight turn for: %s", text)
+                await self.brain.interrupt()
             self.inbox.put_nowait(("voice", text))
         else:
             self.mouth.chime("error")
@@ -398,6 +448,8 @@ class Jarvis:
             self.processing, self.state = True, BUSY
             self.turn = {"source": source, "text": text, "started": time.time(), "first_speech": None}
             events.emit("turn_start", source=source, text=text)
+            if source in ("voice", "typed"):          # a quick spoken ack so he never feels silent
+                self.mouth.say(random.choice(["On it.", "One moment.", "Checking.", "Right away.", "Working on it."]))
             prompt = text if source == "worker" else time_tag() + " " + (text if source == "voice" else f"[typed] {text}")
             print(f"\nYou: {text}", flush=True)
             try:

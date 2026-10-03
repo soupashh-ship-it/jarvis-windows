@@ -1,4 +1,4 @@
-"""Jarvis desktop widget: a Dynamic Island style capsule, always on top and click-through, bottom centre of a monitor.
+"""Jarvis desktop widget: a Dynamic Island style capsule, always on top, bottom centre of a monitor.
 
 Resting, it's a small dark pill with a dim mic (a collapsed Dynamic Island). It springs open when you start talking
 (wake word or hotkey), stays open while listening, thinking and speaking, and settles back into the pill a couple of
@@ -21,15 +21,15 @@ import time
 
 from PySide6.QtCore import QObject, QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (QColor, QConicalGradient, QFont, QFontMetricsF, QLinearGradient, QPainter, QPainterPath,
-                           QPen, QPixmap, QRadialGradient)
+                           QPen, QPixmap, QRadialGradient, QRegion)
 from PySide6.QtWidgets import QApplication, QWidget
 
 import config
 import design as d
 
 TITLE = "Jarvis Widget"
-CAP_W = 600                                   # expanded capsule width
-CAP_MAX_H = 132
+CAP_W = 460                                  # expanded capsule width
+CAP_MAX_H = 104
 PAD_X, PAD_TOP, PAD_BOTTOM = 22, 20, 26       # room around the capsule for its shadow and edge glow
 W, H = CAP_W + 2 * PAD_X, CAP_MAX_H + PAD_TOP + PAD_BOTTOM
 PORT = 8765
@@ -40,12 +40,18 @@ LINGER_S = 2.5                                # stays up this long after he fini
 NOTE_S = 4.0                                  # background-work / offline notes show this long
 
 LABELS = {"idle": "Idle", "listening": "Listening", "thinking": "Thinking", "speaking": "Jarvis",
-          "waiting": "Say yes or no", "offline": "Jarvis isn't running"}
+          "waiting": "Say yes or no", "offline": "Jarvis isn't running", "working": "Working"}
 TOOL_NAMES = {"screenshot": "looking at the screen", "click_at": "clicking", "move_mouse": "moving the mouse",
               "scroll": "scrolling", "type_text": "typing", "press_keys": "pressing keys", "open_app": "opening an app",
               "focus_window": "switching windows", "list_windows": "checking windows", "media": "media controls",
               "volume": "volume", "run_command": "running a command", "write_file": "writing a file",
-              "start_worker": "starting a worker", "annotate": "pointing on screen"}
+              "start_worker": "starting a worker", "annotate": "pointing on screen",
+              "set_timer": "setting a timer", "list_timers": "checking timers", "cancel_timer": "cancelling a timer",
+              "app_volume": "changing app volume", "find_file": "finding a file", "web_search": "searching the web",
+              "organize_folder": "tidying files", "find_duplicates": "looking for duplicates", "biggest_files": "checking file sizes",
+              "system_info": "checking the PC", "weather_now": "checking the weather", "clipboard": "using the clipboard",
+              "ui_click": "clicking a button", "web_browse": "browsing the web",
+              "remember": "remembering", "recall": "recalling", "read_screen_text": "reading the screen"}
 
 
 def short_dur(sec):
@@ -148,15 +154,57 @@ def place_window(w):
     w.move(x, y)
 
 
+def clamp_on_screen(x, y, margin=60):
+    """Keep the window grabbable: at least `margin` px of it stays on some screen."""
+    u = None
+    for s in QApplication.screens():
+        g = s.availableGeometry()
+        u = g if u is None else u.united(g)
+    if u is None:
+        return x, y
+    return (min(max(x, u.left() - W + margin), u.right() - margin),
+            min(max(y, u.top() - H + margin), u.bottom() - margin))
+
+
+def load_pos():
+    """A dragged window position from an earlier run, or None (use the config corner)."""
+    try:
+        with open(config.STATE_FILE, encoding="utf-8") as f:
+            st = json.load(f)
+        x, y = st.get("widget_x"), st.get("widget_y")
+        if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+            return int(x), int(y)
+    except Exception:
+        pass
+    return None
+
+
+def save_pos(x, y):
+    try:
+        try:
+            with open(config.STATE_FILE, encoding="utf-8") as f:
+                st = json.load(f)
+        except Exception:
+            st = {}
+        st["widget_x"], st["widget_y"] = int(x), int(y)
+        with open(config.STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(st, f)
+    except Exception:
+        pass
+
+
 class Widget(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(TITLE)
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
-                            | Qt.WindowTransparentForInput | Qt.WindowDoesNotAcceptFocus)
+                            | Qt.WindowDoesNotAcceptFocus)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.setFixedSize(W, H)
+        self.setCursor(Qt.OpenHandCursor)
+        self._drag_off = None           # QPoint: grab offset while the capsule is being dragged
+        self._mask_rect = None          # last capsule rect the click mask was built from
         self.activity = ""                # unknown until the first poll, so starting with Jarvis off still says so
         self.mic = self.out = 0.0         # smoothed levels
         self.mic_raw = self.out_raw = 0.0
@@ -167,10 +215,11 @@ class Widget(QWidget):
         self.tasks = {}                   # background work: task_id -> {description, started, last_tool}
         self.self_started = False
         self.t0 = self.last_tick = time.time()
+        self.activity_since = time.time()       # when the current state began (for the "· Xs" in the label)
         self.linger_until = 0.0           # stays up this long after he finishes
         self.note_until = 0.0             # a background-work or offline note shows until then
         self.task_ids = frozenset()
-        self.font_label = d.font(12, QFont.DemiBold)
+        self.font_label = d.font_mono(12)
         self.font_text = d.font(15)
         self.font_small = d.font(13)
         self.font_pill = d.font(14, QFont.Medium)
@@ -184,6 +233,8 @@ class Widget(QWidget):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
         self.timer.start(16)
+        self._mask_rect = self.capsule().toAlignedRect()
+        self.setMask(QRegion(self._mask_rect))
 
     # ---------- events ----------
 
@@ -194,6 +245,7 @@ class Widget(QWidget):
             if ev["activity"] == "offline":
                 self.note_until = time.time() + NOTE_S
             self.activity = ev["activity"]
+            self.activity_since = time.time()
         self.mic_raw, self.out_raw = ev.get("mic", 0), ev.get("out", 0)
         self.question = ev.get("question", "")
         self.you, self.said, self.step = ev.get("you", ""), ev.get("said", ""), ev.get("step", "")
@@ -213,9 +265,10 @@ class Widget(QWidget):
             elapsed = short_dur(now - min(t["started"] for t in self.tasks.values()))
             footer = f"Background work · {elapsed}"
         if a == "listening":
-            label, text = "You", self.you or "..."
+            label, text = "Listening", self.you or "..."
         elif a == "thinking":
-            label = "Worker update" if self.self_started else "Thinking"
+            # mid-answer it says "Thinking"; once a tool actually starts, it reads "Working" so you can tell
+            label = "Worker update" if self.self_started else ("Working" if self.step else "Thinking")
             if self.step:
                 text = self.step
             else:
@@ -247,6 +300,8 @@ class Widget(QWidget):
         if self.activity in ACTIVE:
             self.linger_until = now + LINGER_S
         show = self.activity in ACTIVE or bool(self.tasks) or now < self.linger_until or now < self.note_until
+        if self.activity == "listening" and not self.you:   # the silent window after wake/follow-up: stay as the small pill
+            show = False
         self.presence.target = 100 if show else 0
         if show or self.content is None:   # while tucking away, keep showing what was there
             self.content = self.compose(now)
@@ -256,6 +311,10 @@ class Widget(QWidget):
         self.cap_w.target, self.cap_h.target = self.target_size(self.content)
         for spring in (self.cap_w, self.cap_h, self.presence):
             spring.step(dt)
+        cap_rect = self.capsule().toAlignedRect()   # clicks land on the capsule only; around it stays click-through
+        if cap_rect != self._mask_rect:
+            self._mask_rect = cap_rect
+            self.setMask(QRegion(cap_rect))
         if not show and not self.presence.moving:      # resting pill: still, so only redraw if it changes
             key = ("rest", self.activity == "offline", bool(self.tasks))
             if key != self.last_key:
@@ -275,11 +334,44 @@ class Widget(QWidget):
         elif orb_only:
             cap = self.capsule()
             self.update(QRectF(cap.left() - 4, cap.top(), 66, min(cap.height(), 64)).toAlignedRect())
+            self.update(QRectF(cap.right() - 60, cap.top(), 60, 34).toAlignedRect())   # the elapsed readout
             if self.activity == "thinking":                     # the shimmering label
                 self.update(QRectF(cap.left(), cap.top(), cap.width(), 34).toAlignedRect())
         self.timer.setInterval(16 if morphing or voice else 33 if orb_only else 100)
 
+    # ---------- dragging ----------
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton and self.capsule().contains(e.position()):
+            self._drag_off = e.globalPosition().toPoint() - self.pos()
+            self.setCursor(Qt.ClosedHandCursor)
+            e.accept()
+        else:
+            e.ignore()
+
+    def mouseMoveEvent(self, e):
+        if self._drag_off is None:
+            return
+        pos = e.globalPosition().toPoint() - self._drag_off
+        self.move(*clamp_on_screen(pos.x(), pos.y()))
+        e.accept()
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.LeftButton and self._drag_off is not None:
+            self._drag_off = None
+            self.setCursor(Qt.OpenHandCursor)
+            save_pos(self.x(), self.y())        # next start opens where you left it
+            e.accept()
+
     # ---------- layout ----------
+
+    def _state_name(self):
+        """What colour/name this frame shows for itself: Working while it's doing something, else the activity."""
+        if self.activity == "thinking" and self.step:
+            return "working"
+        if self.activity in ("idle", "offline") and self.tasks:
+            return "working"
+        return self.activity if self.activity in d.COLORS else "idle"
 
     def bare(self, content):
         """Speaking (and the moment after) has no icon: the capsule's glowing edge is the voice."""
@@ -298,7 +390,7 @@ class Widget(QWidget):
         if not text:
             return 0
         fm = QFontMetricsF(self.font_text)
-        r = fm.boundingRect(QRectF(0, 0, CAP_W - (44 if bare else 80), 1000), Qt.TextWordWrap, text)
+        r = fm.boundingRect(QRectF(0, 0, CAP_W - (44 if bare else 60), 1000), Qt.TextWordWrap, text)
         return min(r.height(), 3 * fm.lineSpacing())
 
     def capsule(self):
@@ -318,13 +410,17 @@ class Widget(QWidget):
         p = QPainter(self)
         p.setRenderHints(QPainter.Antialiasing | QPainter.TextAntialiasing)
         cap = self.capsule()
-        radius = min(d.RADIUS_ISLAND, cap.height() / 2)
         path = QPainterPath()
-        path.addRoundedRect(cap, radius, radius)
-        p.drawPixmap(0, 0, self.glass(cap, path))
-        if self.activity == "speaking":
-            self.draw_edge_glow(p, cap, path)
-        if self.presence.value < 40:                         # resting (or nearly): just a dim mic
+        path.addRoundedRect(cap, 12, 12)
+        p.fillPath(path, d.ISLAND)                   # flat dark slab, no sheen
+        # a state-coloured underbar that pulses while he's alive
+        now = time.time() - self.t0
+        pulse = 0.55 + 0.45 * math.sin(now * (5.0 if self.activity == "listening" else 1.6))
+        col = d.color(self._state_name())
+        p.setPen(Qt.NoPen)
+        p.setBrush(d.alpha(col, 0.55 + 0.35 * pulse if self.activity in ACTIVE else 0.5))
+        p.drawRoundedRect(QRectF(cap.left() + 14, cap.bottom() - 4.5, cap.width() - 28, 2.6), 1.3, 1.3)
+        if self.presence.value < 40:                         # resting (or nearly): just the equalizer
             self.draw_rest(p, cap, d.clamp01(1 - self.presence.value / 40))
         if self.presence.value < 60:                         # too small for words yet
             return
@@ -378,51 +474,60 @@ class Widget(QWidget):
         p.setOpacity(base)
 
     def draw_rest(self, p, cap, k):
-        """The resting pill: a tiny dim mic in the middle, plus a faint dot while background work runs."""
+        """The resting pill: a tiny equalizer in the state's colour, plus the background-work dot."""
         c = cap.center()
         if self.activity == "idle" and self.tasks:
             self.draw_sun(p, c, 8)
             return
-        col = d.alpha(d.LABEL, (0.22 if self.activity == "offline" else 0.42) * k)
+        if self.activity == "listening":
+            col = d.alpha(d.color("listening"), (0.35 + 0.55 * self.mic) * k)
+        elif self.activity == "offline":
+            col = d.alpha(d.LABEL, 0.25 * k)
+        elif self.activity == "working":
+            col = d.alpha(d.color("working"), 0.7 * k)
+        else:
+            col = d.alpha(d.LABEL, 0.5 * k)
+        n, w, gap, t = 5, 3.0, 3.2, time.time() - self.t0
+        level = self.mic if self.activity == "listening" else 0.25 + 0.2 * math.sin(t * 1.8)
         p.setPen(Qt.NoPen)
         p.setBrush(col)
-        p.drawRoundedRect(QRectF(c.x() - 2.6, c.y() - 7, 5.2, 8.6), 2.6, 2.6)
-        p.setPen(QPen(col, 1.3, Qt.SolidLine, Qt.RoundCap))
-        p.setBrush(Qt.NoBrush)
-        cradle = QPainterPath()
-        cradle.moveTo(c.x() - 4.6, c.y() - 1.6)
-        cradle.cubicTo(c.x() - 4.6, c.y() + 4.6, c.x() + 4.6, c.y() + 4.6, c.x() + 4.6, c.y() - 1.6)
-        p.drawPath(cradle)
-        p.drawLine(QPointF(c.x(), c.y() + 3.2), QPointF(c.x(), c.y() + 6.2))
+        for i in range(n):
+            phase = (t * 6 + i * 1.3) % math.tau
+            h = 3 + 11 * max(0.12, level * (0.55 + 0.45 * math.sin(phase)))
+            x = c.x() + (i - (n - 1) / 2) * (w + gap) - w / 2
+            p.drawRoundedRect(QRectF(x, c.y() - h / 2, w, h), w / 2, w / 2)
         if self.tasks:
             p.setPen(Qt.NoPen)
-            p.setBrush(d.alpha(d.color("background"), 0.55 * k))
+            p.setBrush(d.alpha(d.color("working"), 0.55 * k))
             p.drawEllipse(QPointF(cap.right() - 16, c.y()), 2.5, 2.5)
 
     def draw_compact(self, p, cap, text):
-        self.draw_orb(p, QPointF(cap.left() + 22, cap.center().y()), 9)
+        dot_c = d.color(self._state_name())
+        p.setPen(Qt.NoPen)
+        p.setBrush(dot_c)
+        p.drawEllipse(QPointF(cap.left() + 18, cap.center().y()), 3.5, 3.5)
         p.setFont(self.font_pill)
         p.setPen(d.TERTIARY if self.activity == "offline" else d.SECONDARY)
-        r = QRectF(cap.left() + 40, cap.top(), cap.width() - 54, cap.height())
+        r = QRectF(cap.left() + 30, cap.top(), cap.width() - 44, cap.height())
         p.drawText(r, Qt.AlignLeft | Qt.AlignVCenter, p.fontMetrics().elidedText(text, Qt.ElideRight, int(r.width())))
 
     def draw_expanded(self, p, cap, label, text, dim, footer, lines):
         a, t = self.activity, time.time() - self.t0
-        icon = QPointF(cap.left() + 31, cap.top() + 32)
-        if self.bare(self.content):
-            left = cap.left() + 22
-        elif a == "idle" and lines:
-            self.draw_sun(p, icon, 12)
-            left = cap.left() + 62
-        elif a == "listening":
-            self.draw_mic(p, icon)
-            left = cap.left() + 62
-        else:
-            self.draw_orb(p, icon, 13)
-            left = cap.left() + 62
+        # a small glowing state dot lines up with the label; text starts after it
+        bare = self.bare(self.content)
+        if not bare:
+            dot_c = d.color(self._state_name())
+            pulse = 0.6 + 0.4 * math.sin((time.time() - self.t0) * (5.0 if self.activity == "listening" else 2.0))
+            p.setPen(Qt.NoPen)
+            p.setBrush(d.alpha(dot_c, 0.25 * (pulse if a in ACTIVE else 0.8)))
+            p.drawEllipse(QPointF(cap.left() + 26, cap.top() + 22), 6.5, 6.5)   # soft halo
+            p.setBrush(d.alpha(dot_c, 1.0))
+            p.drawEllipse(QPointF(cap.left() + 26, cap.top() + 22), 3.6, 3.6)
+        left = cap.left() + 40 if not bare else cap.left() + 18
         top, right = cap.top() + 14, cap.right() - 22
         p.setFont(self.font_label)
-        label_rect = QRectF(left, top, right - left, 16)
+        label_rect = QRectF(left, top, right - left - 48, 16)
+        label = label.upper()
         if a == "thinking":                                   # a soft highlight sweeping across the label
             x = label_rect.left() + ((t * 0.55) % 1.6 - 0.3) * 260
             g = QLinearGradient(x - 60, 0, x + 60, 0)
@@ -432,11 +537,16 @@ class Widget(QWidget):
             g.setColorAt(1, base)
             p.setPen(QPen(g, 1))
         elif a == "idle" and lines:
-            p.setPen(d.color("background"))
+            p.setPen(d.color("working"))
         else:
             p.setPen(d.SECONDARY if a in ("speaking", "idle") else d.color(a))
         p.drawText(label_rect, Qt.AlignLeft | Qt.AlignVCenter,
                    p.fontMetrics().elidedText(label, Qt.ElideRight, int(label_rect.width())))
+        if a in ACTIVE and self.activity_since:                 # elapsed in this state, HUD-style, right-aligned
+            p.setFont(d.font_mono(10, QFont.Normal))
+            p.setPen(d.alpha(d.TERTIARY, 1.0))
+            p.drawText(QRectF(right - 44, top, 44, 16), Qt.AlignRight | Qt.AlignVCenter,
+                       short_dur(time.time() - self.activity_since))
         body_top = top + 20
         bottom = cap.bottom() - 14 - (20 if footer else 0)
         if lines:
@@ -456,10 +566,10 @@ class Widget(QWidget):
             p.drawText(box, Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap, self.fit(p, text, box, a == "waiting"))
         if footer:
             p.setFont(self.font_label)
-            p.setBrush(d.color("background"))
+            p.setBrush(d.color("working"))
             p.setPen(Qt.NoPen)
             p.drawEllipse(QPointF(left + 3, cap.bottom() - 22), 3, 3)
-            p.setPen(d.alpha(d.color("background"), 0.75))
+            p.setPen(d.alpha(d.color("working"), 0.75))
             p.drawText(QRectF(left + 12, cap.bottom() - 30, right - left, 16), Qt.AlignLeft | Qt.AlignVCenter, footer)
 
     def draw_mic(self, p, c):
@@ -555,6 +665,10 @@ class Widget(QWidget):
         gloss.setColorAt(1, QColor(255, 255, 255, 0))
         p.setBrush(gloss)
         p.drawEllipse(c, r, r)
+        if a == "waiting":                                          # "?" in the orb: it's asking you
+            p.setFont(d.font(14, QFont.DemiBold))
+            p.setPen(QPen(d.on(base), 1.5))
+            p.drawText(QRectF(c.x() - r, c.y() - r, 2 * r, 2 * r), Qt.AlignCenter, "?")
         if self.tasks and a == "idle":                        # background work: an amber dot circling the orb
             ang = t * 1.6
             p.setBrush(d.color("background"))
@@ -582,6 +696,10 @@ def main():
     app.setDesktopFileName("jarvis-widget")
     w = Widget()
     place_window(w)
+    saved = load_pos()                  # back where you dragged it, if that spot is still on a screen
+    if saved is not None and any(s.geometry().contains(saved[0] + W // 2, saved[1] + H // 2)
+                                 for s in QApplication.screens()):
+        w.move(*clamp_on_screen(*saved))
     feed = Feed()
     feed.event.connect(w.on_event)
     w.show()

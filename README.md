@@ -162,7 +162,7 @@ A mistake inside `config_local.py` (a typo, an import that fails) now stops Jarv
 
 It starts at logon by itself. To run it by hand instead (you see its log in the window): `.venv\Scripts\python jarvis.py`. The log is always in `logs\jarvis.log` (it rotates at 2 MB, keeping three old ones); when it runs windowless, anything a library prints goes to `logs\console.log`.
 
-The widget is a small capsule at the bottom centre of the screen. Resting, it's a little pill with a dim mic; it springs open when you talk to Jarvis, with one colour per state: a blue mic that pulses with your voice while listening, a white orb while thinking, a purple glow round the edge while he speaks, orange when he's waiting for a yes or no. It settles back a couple of seconds after he finishes. It never takes the mouse or keyboard. (The Linux version blurs what's behind it; Windows can't blur behind a shape, so here it's a translucent dark fill.)
+The widget is a small capsule at the bottom centre of the screen. Resting, it's a little pill with a dim mic; it springs open when you talk to Jarvis, with one colour per state: a blue mic that pulses with your voice while listening, a white orb while thinking, a purple glow round the edge while he speaks, orange when he's waiting for a yes or no. It settles back a couple of seconds after he finishes. Drag the capsule itself anywhere (it remembers the spot next time); everywhere around it stays click-through, and it never takes the keyboard. (The Linux version blurs what's behind it; Windows can't blur behind a shape, so here it's a translucent dark fill.)
 
 Dashboard: run `.venv\Scripts\python jarvisctl.py dashboard`. It opens http://127.0.0.1:8765 (this PC only) with the key from `logs\ctl.token`, so other Windows accounts on the same PC can't see or drive it; your browser keeps the key in a cookie, so later visits and Jarvis restarts don't need it again (delete `logs\ctl.token` to change it). On a shared PC keep the Jarvis folder inside your own user folder. The dashboard shows what Jarvis is doing, background workers, history with every step and screenshot, what it heard, and has Yes/No buttons and a box for typed commands.
 
@@ -212,13 +212,34 @@ The command rules are a pattern match on the command text, not a sandbox: a dete
 
 ## Voice
 
-Kokoro works out of the box with British voices (`bm_lewis` is the default). For a closer JARVIS sound you can train your own Piper voice (see the Piper project's training guide), `pip install piper-tts` into `.venv`, then set `VOICE_ENGINE = "piper"` and `PIPER_MODEL` to the `.onnx` file with its `.onnx.json` next to it. No trained voice or film audio ships with this repo.
+Kokoro works out of the box with British voices (`bm_lewis` is the default). The maintainer's own `config_local.py` uses the Female American **Samantha** voice (`af_aoede`), which is what current Ash builds default to. For a closer JARVIS sound you can train your own Piper voice (see the Piper project's training guide), `pip install piper-tts` into `.venv`, then set `VOICE_ENGINE = "piper"` and `PIPER_MODEL` to the `.onnx` file with its `.onnx.json` next to it. No trained voice or film audio ships with this repo.
+
+**Adding a custom voice** (if you don't like Samantha / want your own):
+
+- **Quick way (no training):** Kokoro ships many voices. Set `VOICE = "<name>"` in `config_local.py`: `bm_lewis`, `bm_george`, `bm_daniel`, `bm_fable` (male British), `af_aoede`, `af_heart`, `af_bella`, `af_sarah` (female American), etc. Restart Jarvis.
+- **Closer JARVIS/MCUED-style sound:** train a Piper voice (Piper has per-voice training docs), put `<voice>.onnx` + `<voice>.onnx.json` in `models/`, and set:
+  ```
+  VOICE_ENGINE = "piper"
+  PIPER_MODEL = "models\\your-voice.onnx"   # the .json sits next to it
+  ```
+- **Web TTS:** point `VOICE_ENGINE = "openai"` at any OpenAI-compatible TTS endpoint (`TTS_BASE_URL`/`TTS_API_KEY`/`TTS_MODEL`); it must support `pcm` output.
+
+## Wake word
+
+By default Jarvis wakes on "**Hey Jarvis**" via openWakeWord's `hey_jarvis_v0.1.onnx`. To wake on "**Hey Samantha**" too (or instead), drop a custom openWakeWord model into `models/` (e.g. `hey_samantha.onnx`) and set in `config_local.py`:
+
+```
+WAKE_WORD_MODELS = ["hey_jarvis_v0.1.onnx", "hey_samantha.onnx"]
+```
+
+A custom model is trained from openWakeWord's docs (same pipeline as their `hey_jarvis` training example); openWakeWord does not ship a `hey_samantha` model, and film audio is not redistributable, so train your own. The same applies for any phrase: put the `.onnx` in `models/`, add its filename to `WAKE_WORD_MODELS`, restart.
 
 ## Tests
 
 ```
 .venv\Scripts\python test_brain.py      # agent loop against a fake model server, safety rules, yes/no parsing, workers, hotkeys
 .venv\Scripts\python test_time_tag.py   # the greeting time tags
+.venv\Scripts\python test_tools.py      # the newer tools: organize_folder, calendar_add, recall, find_duplicates, biggest_files, current_date
 .venv\Scripts\python test_voice.py "Good evening."   # writes logs\voice-kokoro.wav
 ```
 

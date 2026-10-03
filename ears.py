@@ -82,7 +82,23 @@ class Ears:
         self.loop = loop
         self.q = asyncio.Queue(maxsize=300)
         models_dir = os.path.join(os.path.dirname(openwakeword.__file__), "resources", "models")
-        self.oww = Model(wakeword_models=[os.path.join(models_dir, "hey_jarvis_v0.1.onnx")],
+        wanted = list(getattr(config, "WAKE_WORD_MODELS", ["hey_jarvis_v0.1.onnx"]) or ["hey_jarvis_v0.1.onnx"])
+        found = []
+        for entry in wanted:
+            if os.path.isabs(entry) and os.path.isfile(entry):
+                found.append(entry)
+                continue
+            for base in (models_dir, os.path.join(config.JARVIS_DIR, "models")):
+                path = os.path.join(base, os.path.basename(entry))
+                if os.path.isfile(path):
+                    found.append(path)
+                    break
+            else:
+                log.warning("wake word model %r not found; skipping", entry)
+        if not found:
+            found = [os.path.join(models_dir, "hey_jarvis_v0.1.onnx")]
+        log.info("wake word models: %s", ", ".join(os.path.basename(p) for p in found))
+        self.oww = Model(wakeword_models=found,
                          inference_framework="onnx", vad_threshold=config.WAKE_VAD_THRESHOLD)
         self.vad = VAD()
         self.last_score = 0.0

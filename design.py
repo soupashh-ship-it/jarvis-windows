@@ -10,6 +10,7 @@ COLORS = {
     "speaking": "#BF5AF2",      # iOS purple
     "waiting": "#FF9F0A",       # iOS orange: he needs to say yes or no
     "background": "#F2F2F7",    # background-work notes
+    "working": "#30D158",       # background jobs running (the widget's border)
     "idle": "#8E8E93",
     "offline": "#8E8E93",
     "annotate": "#0A84FF",      # the overlay's rings, arrows, boxes and step badges
@@ -31,8 +32,8 @@ LABEL = QColor(255, 255, 255)
 SECONDARY = QColor(235, 235, 245, 153)       # iOS secondaryLabel (60%)
 TERTIARY = QColor(235, 235, 245, 76)         # iOS tertiaryLabel (30%)
 GLASS = QColor(28, 28, 30, 217)              # callout pills
-ISLAND = QColor(10, 10, 12, 190)             # the widget capsule: a translucent fill (Windows has no blur behind a shape)
-HAIRLINE = QColor(255, 255, 255, 34)
+ISLAND = QColor(8, 10, 14, 215)             # the widget capsule: a translucent fill (Windows has no blur behind a shape)
+HAIRLINE = QColor(140, 200, 255, 40)        # softly blue hairline: a more "tech" edge
 
 RADIUS_PILL = 12
 RADIUS_ISLAND = 26
@@ -45,6 +46,7 @@ STAGGER = 0.12
 SPRING = (190.0, 19.0)                       # stiffness, damping: settles in ~0.35 s with a hint of bounce
 
 FAMILIES = ["Inter", "Segoe UI Variable Text", "Segoe UI"]   # first one installed wins
+MONO_FAMILIES = ["Cascadia Mono", "Consolas", "Cascadia Code"]   # for HUD-style labels
 
 
 def font(px, weight=QFont.Normal):
@@ -53,6 +55,14 @@ def font(px, weight=QFont.Normal):
     f.setPixelSize(px)
     f.setWeight(weight)
     f.setHintingPreference(QFont.PreferNoHinting)   # smooth, Apple-like glyphs
+    return f
+
+
+def font_mono(px, weight=QFont.DemiBold):
+    f = QFont()
+    f.setFamilies(MONO_FAMILIES)
+    f.setPixelSize(px)
+    f.setWeight(weight)
     return f
 
 
