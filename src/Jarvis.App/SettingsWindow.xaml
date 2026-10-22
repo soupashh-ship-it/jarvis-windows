@@ -1,0 +1,407 @@
+<Window x:Class="Jarvis.App.SettingsWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="JARVIS — Settings" Width="780" Height="860" MinWidth="700" MinHeight="620"
+        WindowStyle="None" WindowStartupLocation="CenterOwner" ResizeMode="CanResize"
+        Background="{StaticResource WindowBgBrush}" SnapsToDevicePixels="True" UseLayoutRounding="True" Foreground="{StaticResource TextBrush}"
+        FontFamily="{StaticResource UiFont}">
+    <WindowChrome.WindowChrome>
+        <WindowChrome CaptionHeight="0" ResizeBorderThickness="6" GlassFrameThickness="0" CornerRadius="0" UseAeroCaptionButtons="False"/>
+    </WindowChrome.WindowChrome>
+
+    <Border BorderBrush="#16FFFFFF" BorderThickness="1">
+        <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="52"/>
+                <RowDefinition Height="*"/>
+                <RowDefinition Height="64"/>
+            </Grid.RowDefinitions>
+
+            <Grid Grid.Row="0" Background="Transparent" MouseLeftButtonDown="TitleBar_MouseLeftButtonDown">
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="20,0,0,0">
+                    <TextBlock Text="SETTINGS" Style="{StaticResource Caption}" Foreground="{StaticResource AccentBrush}"
+                               VerticalAlignment="Center"/>
+                    <TextBlock Text="Configuration" Margin="12,0,0,0" FontFamily="{StaticResource DisplayFont}"
+                               FontSize="15" FontWeight="Light" VerticalAlignment="Center"/>
+                </StackPanel>
+                <Button Style="{StaticResource CloseButton}" Content="&#xE8BB;" AutomationProperties.Name="Close settings" HorizontalAlignment="Right"
+                        VerticalAlignment="Center" Margin="0,0,12,0" Click="Close_Click"/>
+            </Grid>
+
+            <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Hidden" Margin="0,0,0,0">
+                <StackPanel Margin="22,6,22,18">
+
+                    <!-- identity -->
+                    <TextBlock Text="IDENTITY" Style="{StaticResource Caption}" Margin="4,0,0,8"/>
+                    <Border Style="{StaticResource Card}">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/><ColumnDefinition Width="14"/>
+                                <ColumnDefinition Width="130"/><ColumnDefinition Width="14"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+                            <StackPanel Grid.Column="0">
+                                <TextBlock Text="Your name" Style="{StaticResource Muted}" Margin="0,0,0,6"/>
+                                <TextBox x:Name="NameBox" Style="{StaticResource InputBox}" AutomationProperties.Name="Your name"/>
+                            </StackPanel>
+                            <StackPanel Grid.Column="2">
+                                <TextBlock Text="Honorific" Style="{StaticResource Muted}" Margin="0,0,0,6"/>
+                                <TextBox x:Name="HonorificBox" Style="{StaticResource InputBox}" AutomationProperties.Name="Honorific"/>
+                            </StackPanel>
+                            <StackPanel Grid.Column="4">
+                                <TextBlock Text="City (weather, greetings)" Style="{StaticResource Muted}" Margin="0,0,0,6"/>
+                                <TextBox x:Name="CityBox" Style="{StaticResource InputBox}" AutomationProperties.Name="City for weather and greetings"/>
+                            </StackPanel>
+                        </Grid>
+                    </Border>
+
+                    <!-- brain -->
+                    <TextBlock Text="BRAIN" Style="{StaticResource Caption}" Margin="4,20,0,8"/>
+                    <Border Style="{StaticResource Card}">
+                        <StackPanel>
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/><ColumnDefinition Width="14"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <StackPanel Grid.Column="0">
+                                    <TextBlock Text="Provider" Style="{StaticResource Muted}" Margin="0,0,0,6"/>
+                                    <ComboBox x:Name="PresetCombo" Style="{StaticResource InputCombo}" AutomationProperties.Name="Provider"
+                                              DisplayMemberPath="Label" SelectionChanged="Preset_Changed"/>
+                                </StackPanel>
+                                <StackPanel Grid.Column="2">
+                                    <TextBlock Text="Model" Style="{StaticResource Muted}" Margin="0,0,0,6"/>
+                                    <TextBox x:Name="ModelBox" Style="{StaticResource InputBox}" AutomationProperties.Name="Model"/>
+                                    <ComboBox x:Name="GeminiApiModelCombo" Style="{StaticResource InputCombo}" AutomationProperties.Name="Gemini API model"
+                                              IsEditable="True" DisplayMemberPath="Label"
+                                              SelectionChanged="GeminiApiModel_Changed" Visibility="Collapsed"/>
+                                    <TextBlock x:Name="ModelHintText" Style="{StaticResource Muted}" Margin="0,6,0,0" TextWrapping="Wrap"/>
+                                </StackPanel>
+                            </Grid>
+                            <TextBlock Text="Base URL" Style="{StaticResource Muted}" Margin="0,12,0,6"/>
+                            <TextBox x:Name="BaseUrlBox" Style="{StaticResource InputBox}" AutomationProperties.Name="Provider base URL"/>
+                            <StackPanel x:Name="KeyBlock">
+                                <TextBlock Text="API key  (blank keeps the current key)" Style="{StaticResource Muted}" Margin="0,12,0,6"/>
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/><ColumnDefinition Width="8"/><ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <PasswordBox x:Name="KeyBox" Grid.Column="0" Style="{StaticResource InputPassword}" AutomationProperties.Name="Provider API key"/>
+                                    <Button x:Name="GetKeyButton" Grid.Column="2" Style="{StaticResource GhostButton}" Content="Get key"
+                                            Height="32" Padding="12,0" Click="GetKey_Click" ToolTip="Open the provider's key page in your browser"/>
+                                </Grid>
+                                <TextBlock x:Name="KeyHintText" Style="{StaticResource Muted}" Margin="0,6,0,0" TextWrapping="Wrap"/>
+                            </StackPanel>
+                            <Grid Margin="0,12,0,0">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/><ColumnDefinition Width="14"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <StackPanel Grid.Column="0">
+                                    <TextBlock Text="Worker safety" Style="{StaticResource Muted}" Margin="0,0,0,6"/>
+                                    <TextBlock Style="{StaticResource Caption}" TextWrapping="Wrap"
+                                               Text="Workers follow the same safety checks and ask you before actions that need confirmation."/>
+                                </StackPanel>
+                                <StackPanel Grid.Column="2">
+                                    <TextBlock Text="Temperature  -  max tokens" Style="{StaticResource Muted}" Margin="0,0,0,6"/>
+                                    <Grid>
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/><ColumnDefinition Width="8"/><ColumnDefinition Width="*"/>
+                                        </Grid.ColumnDefinitions>
+                                        <TextBox x:Name="TempBox" Grid.Column="0" Style="{StaticResource InputBox}" AutomationProperties.Name="Model temperature"/>
+                                        <TextBox x:Name="TokensBox" Grid.Column="2" Style="{StaticResource InputBox}" AutomationProperties.Name="Maximum response tokens"/>
+                                    </Grid>
+                                    <TextBlock Style="{StaticResource Caption}" TextWrapping="Wrap" Margin="0,7,0,0"
+                                               Text="Temperature is how loose the answers are: 0 is strict and repeatable, 1 is free and varied. Max tokens is the longest answer it may write - 1600 tokens is roughly 1200 words."/>
+                                </StackPanel>
+                            </Grid>
+                            <StackPanel Orientation="Horizontal" Margin="0,12,0,0">
+                                <Button Style="{StaticResource GhostButton}" Content="Test connection" Height="32" Padding="14,0"
+                                        Click="TestBrain_Click"/>
+                                <TextBlock x:Name="BrainStatus" AutomationProperties.LiveSetting="Polite" Style="{StaticResource Muted}" Margin="12,0,0,0"
+                                           VerticalAlignment="Center" TextTrimming="CharacterEllipsis" MaxWidth="480"/>
+                            </StackPanel>
+                        </StackPanel>
+                    </Border>
+
+                    <!-- voice -->
+                    <TextBlock Text="VOICE" Style="{StaticResource Caption}" Margin="4,20,0,8"/>
+                    <Border Style="{StaticResource Card}">
+                        <StackPanel>
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/><ColumnDefinition Width="14"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <StackPanel Grid.Column="0">
+                                    <TextBlock Text="Engine" Style="{StaticResource Muted}" Margin="0,0,0,6"/>
+                                    <ComboBox x:Name="TtsCombo" Style="{StaticResource InputCombo}" AutomationProperties.Name="Speech engine" SelectionChanged="Tts_Changed"/>
+                                </StackPanel>
+                                <StackPanel Grid.Column="2">
+                                    <TextBlock Text="Rate (0.6 – 1.6)" Style="{StaticResource Muted}" Margin="0,0,0,6"/>
+                                    <TextBox x:Name="RateBox" Style="{StaticResource InputBox}" AutomationProperties.Name="Speech rate"/>
+                                </StackPanel>
+                            </Grid>
+                            <TextBlock Text="Neural voice (Azure Speech)" Style="{StaticResource Muted}" Margin="0,12,0,6"/>
+                            <ComboBox x:Name="EdgeVoiceCombo" Style="{StaticResource InputCombo}" AutomationProperties.Name="Azure neural voice"/>
+                            <Grid Margin="0,10,0,0">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="150"/><ColumnDefinition Width="12"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <StackPanel Grid.Column="0">
+                                    <TextBlock Text="Azure region" Style="{StaticResource Muted}" Margin="0,0,0,6"/>
+                                    <TextBox x:Name="AzureRegionBox" Style="{StaticResource InputBox}" AutomationProperties.Name="Azure Speech region"/>
+                                </StackPanel>
+                                <StackPanel Grid.Column="2">
+                                    <TextBlock Text="Azure Speech key (leave blank to keep)" Style="{StaticResource Muted}" Margin="0,0,0,6"/>
+                                    <PasswordBox x:Name="AzureKeyBox" Style="{StaticResource InputPassword}" AutomationProperties.Name="Azure Speech key"/>
+                                </StackPanel>
+                            </Grid>
+                            <TextBlock Text="A free Azure Speech key gives the closest JARVIS voice, en-GB-RyanNeural. Without one I use the installed Windows voice."
+                                       Style="{StaticResource Caption}" TextWrapping="Wrap" Margin="0,7,0,0"/>
+                            <TextBlock Text="Windows voice (offline fallback)" Style="{StaticResource Muted}" Margin="0,12,0,6"/>
+                            <ComboBox x:Name="SapiVoiceCombo" Style="{StaticResource InputCombo}" AutomationProperties.Name="Windows offline voice"/>
+                            <TextBlock Style="{StaticResource Caption}" TextWrapping="Wrap" Margin="0,7,0,0"
+                                       Text="Only the well-spoken Windows voices are listed - the flat, robotic and novelty ones are hidden."/>
+                            <Grid Margin="0,12,0,0">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/><ColumnDefinition Width="14"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <StackPanel Grid.Column="0">
+                                    <TextBlock Text="Volume (0-100)" Style="{StaticResource Muted}" Margin="0,0,0,6"/>
+                                    <TextBox x:Name="VolumeBox" Style="{StaticResource InputBox}" AutomationProperties.Name="Speech volume percent"/>
+                                </StackPanel>
+                                <StackPanel Grid.Column="2" VerticalAlignment="Bottom">
+                                    <CheckBox x:Name="SpeakRepliesCheck" Style="{StaticResource InputCheck}"
+                                              Content="Speak replies aloud"/>
+                                </StackPanel>
+                            </Grid>
+                            <TextBlock Text="Playback device" Style="{StaticResource Muted}" Margin="0,12,0,6"/>
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="8"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <ComboBox x:Name="SpeakerCombo" Grid.Column="0" Style="{StaticResource InputCombo}" AutomationProperties.Name="Playback device"
+                                          ToolTip="Where JARVIS speaks. Changes take effect when you save."/>
+                                <Button Grid.Column="2" Style="{StaticResource GhostButton}" Content="Refresh"
+                                        Height="32" Padding="12,0" Click="RefreshDevices_Click"
+                                        ToolTip="Rescan for devices plugged in since this window opened"/>
+                            </Grid>
+                            <StackPanel Orientation="Horizontal" Margin="0,12,0,0">
+                                <Button Style="{StaticResource GhostButton}" Content="Test voice" Height="32" Padding="14,0"
+                                        Click="TestVoice_Click"/>
+                                <TextBlock x:Name="VoiceStatus" AutomationProperties.LiveSetting="Polite" Style="{StaticResource Muted}" Margin="12,0,0,0"
+                                           VerticalAlignment="Center" TextTrimming="CharacterEllipsis" MaxWidth="460"/>
+                            </StackPanel>
+                        </StackPanel>
+                    </Border>
+
+                    <!-- listening -->
+                    <TextBlock Text="LISTENING" Style="{StaticResource Caption}" Margin="4,20,0,8"/>
+                    <Border Style="{StaticResource Card}">
+                        <StackPanel>
+                            <CheckBox x:Name="WakeCheck" Style="{StaticResource InputCheck}" Content="Listen for the wake word"/>
+                            <Grid Margin="0,12,0,0">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/><ColumnDefinition Width="14"/>
+                                    <ColumnDefinition Width="150"/>
+                                </Grid.ColumnDefinitions>
+                                <StackPanel Grid.Column="0">
+                                    <TextBlock Text="Wake phrase" Style="{StaticResource Muted}" Margin="0,0,0,6"/>
+                                    <TextBox x:Name="WakePhraseBox" Style="{StaticResource InputBox}" AutomationProperties.Name="Wake phrase"/>
+                                </StackPanel>
+                                <StackPanel Grid.Column="2">
+                                    <TextBlock Text="Confidence (0.01-0.95)" Style="{StaticResource Muted}" Margin="0,0,0,6"/>
+                                    <TextBox x:Name="WakeConfBox" Style="{StaticResource InputBox}" AutomationProperties.Name="Wake word confidence threshold"/>
+                                </StackPanel>
+                            </Grid>
+                            <Grid Margin="0,12,0,0">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/><ColumnDefinition Width="14"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <StackPanel Grid.Column="0">
+                                    <TextBlock Text="Follow-up listen (seconds)" Style="{StaticResource Muted}" Margin="0,0,0,6"/>
+                                    <TextBox x:Name="FollowUpBox" Style="{StaticResource InputBox}" AutomationProperties.Name="Follow-up listening duration in seconds"/>
+                                </StackPanel>
+                                <StackPanel Grid.Column="2" VerticalAlignment="Bottom">
+                                    <CheckBox x:Name="BargeInCheck" Style="{StaticResource InputCheck}"
+                                              Content="Stop speaking when you talk (headphones)" Margin="0,0,0,4"/>
+                                </StackPanel>
+                            </Grid>
+                            <TextBlock Text="Microphone" Style="{StaticResource Muted}" Margin="0,12,0,6"/>
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="8"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="8"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <ComboBox x:Name="MicCombo" Grid.Column="0" Style="{StaticResource InputCombo}" AutomationProperties.Name="Microphone input device"
+                                          SelectionChanged="MicCombo_SelectionChanged"
+                                          ToolTip="Which microphone hears the wake word. Pick one and speak: the bar below shows what it hears."/>
+                                <Button x:Name="TestMicButton" Grid.Column="2" Style="{StaticResource GhostButton}"
+                                        Content="Test microphone" Height="32" Padding="12,0" Click="TestMic_Click"/>
+                                <Button Grid.Column="4" Style="{StaticResource GhostButton}" Content="Refresh"
+                                        Height="32" Padding="12,0" Click="RefreshDevices_Click"
+                                        ToolTip="Rescan for devices plugged in since this window opened"/>
+                            </Grid>
+                            <Grid Margin="0,8,0,0">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <ProgressBar x:Name="MicMeter" Grid.Column="0" Style="{StaticResource InputMeter}" AutomationProperties.Name="Microphone input level"
+                                             Height="6" Minimum="0" Maximum="1" Value="0" VerticalAlignment="Center"/>
+                                <TextBlock x:Name="MicLevelText" Grid.Column="1" Style="{StaticResource Mono}"
+                                           Text="silent" Margin="10,0,0,0" MinWidth="80" TextAlignment="Right"
+                                           VerticalAlignment="Center"/>
+                            </Grid>
+                            <TextBlock x:Name="MicStatus" AutomationProperties.LiveSetting="Polite" Style="{StaticResource Muted}" Margin="0,7,0,0"
+                                       TextWrapping="Wrap"/>
+                            <Grid Margin="0,10,0,0">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <StackPanel Grid.Column="0">
+                                    <TextBlock Text="Input gain (0.5x to 4x)" Style="{StaticResource Muted}" Margin="0,0,0,2"/>
+                                    <Slider x:Name="MicGainSlider" Style="{StaticResource InputSlider}" AutomationProperties.Name="Microphone input gain"
+                                            Minimum="0.5" Maximum="4" Value="1" SmallChange="0.1" LargeChange="0.5"
+                                            ValueChanged="MicGain_Changed"/>
+                                </StackPanel>
+                                <TextBlock x:Name="MicGainText" Grid.Column="1" Style="{StaticResource Mono}"
+                                           Text="1.0x" MinWidth="46" TextAlignment="Right"
+                                           VerticalAlignment="Bottom" Margin="10,0,0,4"/>
+                            </Grid>
+                            <TextBlock Text="A new microphone, speaker or wake phrase applies as soon as you save. The confidence and follow-up window adjust live. If the bar above never moves while you speak, that microphone is silent - pick another one."
+                                       Style="{StaticResource Caption}" TextWrapping="Wrap" Margin="0,10,0,0"/>
+                        </StackPanel>
+                    </Border>
+
+                    <!-- interface -->
+                    <TextBlock Text="INTERFACE" Style="{StaticResource Caption}" Margin="4,20,0,8"/>
+                    <Border Style="{StaticResource Card}">
+                        <StackPanel>
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/><ColumnDefinition Width="14"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <StackPanel Grid.Column="0">
+                                    <TextBlock Text="HUD monitor" Style="{StaticResource Muted}" Margin="0,0,0,6"/>
+                                    <ComboBox x:Name="HudMonitorCombo" Style="{StaticResource InputCombo}" AutomationProperties.Name="HUD monitor"/>
+                                </StackPanel>
+                                <StackPanel Grid.Column="2" VerticalAlignment="Bottom">
+                                    <CheckBox x:Name="HudCheck" Style="{StaticResource InputCheck}" Content="Show the emitter-line HUD" Margin="0,0,0,4"/>
+                                    <CheckBox x:Name="StartupCheck" Style="{StaticResource InputCheck}" Content="Start with Windows" Margin="0,8,0,0"/>
+                                </StackPanel>
+                            </Grid>
+                            <Grid Margin="0,12,0,0">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/><ColumnDefinition Width="14"/>
+                                    <ColumnDefinition Width="*"/><ColumnDefinition Width="14"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <StackPanel Grid.Column="0">
+                                    <TextBlock Text="Talk hotkey" Style="{StaticResource Muted}" Margin="0,0,0,6"/>
+                                    <TextBox x:Name="HotkeyTalkBox" Style="{StaticResource InputBox}" AutomationProperties.Name="Talk hotkey"
+                                             ToolTip="Click and press a combination, or type it (for example Ctrl+Alt+J)."
+                                             PreviewKeyDown="HotkeyBox_PreviewKeyDown"
+                                             GotKeyboardFocus="HotkeyBox_GotKeyboardFocus"/>
+                                </StackPanel>
+                                <StackPanel Grid.Column="2">
+                                    <TextBlock Text="Stop hotkey" Style="{StaticResource Muted}" Margin="0,0,0,6"/>
+                                    <TextBox x:Name="HotkeyStopBox" Style="{StaticResource InputBox}" AutomationProperties.Name="Stop hotkey"
+                                             ToolTip="Click and press a combination, or type it (for example Ctrl+Alt+Escape)."
+                                             PreviewKeyDown="HotkeyBox_PreviewKeyDown"
+                                             GotKeyboardFocus="HotkeyBox_GotKeyboardFocus"/>
+                                </StackPanel>
+                                <StackPanel Grid.Column="4">
+                                    <TextBlock Text="Show deck hotkey" Style="{StaticResource Muted}" Margin="0,0,0,6"/>
+                                    <TextBox x:Name="HotkeyDeckBox" Style="{StaticResource InputBox}" AutomationProperties.Name="Show deck hotkey"
+                                             ToolTip="Click and press a combination, or type it (for example Ctrl+Alt+Space)."
+                                             PreviewKeyDown="HotkeyBox_PreviewKeyDown"
+                                             GotKeyboardFocus="HotkeyBox_GotKeyboardFocus"/>
+                                </StackPanel>
+                            </Grid>
+                            <Grid Margin="0,12,0,0">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/><ColumnDefinition Width="14"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <CheckBox x:Name="AllMonitorsCheck" Grid.Column="0" Style="{StaticResource InputCheck}"
+                                          Content="Show the HUD on every monitor"/>
+                                <CheckBox x:Name="GreetCheck" Grid.Column="2" Style="{StaticResource InputCheck}"
+                                          Content="Greet me when JARVIS starts"/>
+                            </Grid>
+                        </StackPanel>
+                    </Border>
+
+                    <!-- safety -->
+                    <TextBlock Text="SAFETY AND MANNERS" Style="{StaticResource Caption}" Margin="4,20,0,8"/>
+                    <Border Style="{StaticResource Card}">
+                        <StackPanel>
+                            <CheckBox x:Name="ConfirmCheck" Style="{StaticResource InputCheck}"
+                                      Content="Ask before risky actions (delete, send, system changes)"/>
+                            <CheckBox x:Name="VoiceConfirmCheck" Style="{StaticResource InputCheck}"
+                                      Content="Ask the question out loud and listen for yes or no" Margin="0,10,0,0"/>
+                            <CheckBox x:Name="PoliteCheck" Style="{StaticResource InputCheck}"
+                                      Content="Hold unprompted updates while you are on a call" Margin="0,10,0,0"/>
+                            <CheckBox x:Name="NetworkCheck" Style="{StaticResource InputCheck}"
+                                      Content="Allow network tools (weather, web)" Margin="0,10,0,0"/>
+                            <TextBlock Text="Extra folders JARVIS may write to without asking (one per line)"
+                                       Style="{StaticResource Muted}" Margin="0,14,0,6"/>
+                            <TextBox x:Name="WriteDirsBox" Style="{StaticResource InputBox}" AutomationProperties.Name="Additional folders JARVIS may write to" Height="70"
+                                     AcceptsReturn="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"/>
+                        </StackPanel>
+                    </Border>
+
+                    <Border Style="{StaticResource Card}" Margin="0,14,0,0">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                                <ColumnDefinition Width="Auto"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <StackPanel Grid.Column="0">
+                                <TextBlock Text="Data folder" Style="{StaticResource Muted}"/>
+                                <TextBlock x:Name="DataPathText" Style="{StaticResource Caption}" Margin="0,4,0,0"
+                                           TextTrimming="CharacterEllipsis"/>
+                                <TextBlock x:Name="VersionText" Style="{StaticResource Caption}" Margin="0,4,0,0"/>
+                            </StackPanel>
+                            <Button Grid.Column="1" Style="{StaticResource GhostButton}" Content="Open folder" Height="30" Padding="12,0"
+                                    Margin="12,0,0,0" Click="OpenData_Click"/>
+                            <Button Grid.Column="2" Style="{StaticResource GhostButton}" Content="Open logs" Height="30" Padding="12,0"
+                                    Margin="8,0,0,0" Click="OpenLogs_Click"/>
+                            <Button Grid.Column="3" Style="{StaticResource GhostButton}" Content="Reset setup" Height="30" Padding="12,0"
+                                    Margin="8,0,0,0" Click="ResetSetup_Click"/>
+                        </Grid>
+                    </Border>
+
+                </StackPanel>
+            </ScrollViewer>
+
+            <Grid Grid.Row="2" Margin="22,0,22,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="10"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock x:Name="FooterStatus" Grid.Column="0" AutomationProperties.LiveSetting="Polite" Style="{StaticResource Muted}" VerticalAlignment="Center"
+                           TextTrimming="CharacterEllipsis"/>
+                <Button Grid.Column="1" Style="{StaticResource GhostButton}" Content="Cancel" Width="96" Height="36" Padding="12,0"
+                        Click="Close_Click"/>
+                <Button Grid.Column="3" Style="{StaticResource PrimaryButton}" Content="Save changes" Width="140" Height="36" Padding="14,0"
+                        Click="Save_Click"/>
+            </Grid>
+        </Grid>
+    </Border>
+</Window>

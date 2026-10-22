@@ -1,0 +1,43 @@
+# Build output
+bin/
+obj/
+dist/
+publish/
+.vs/
+.idea/
+TestResults/
+
+# Local agent and IDE state
+.agents/
+.codex/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Logs, runtime data, and local configuration
+logs/
+data/
+*.log
+.env
+.env.*
+!.env.example
+config_local.*
+appsettings.Local.json
+appsettings.*.local.json
+secrets.json
+*.db
+*.sqlite
+*.sqlite3
+
+# Credentials and signing material
+*.pem
+*.pfx
+*.p12
+*.key
+*.cer
+
+# Local reports and captures
+docs/release-readiness-*/
+screenshots/
+captures/

@@ -1,0 +1,12 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Jarvis.App/Jarvis.App.csproj" />
+    <Project Path="src/Jarvis.Core/Jarvis.Core.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Jarvis.Tests/Jarvis.Tests.csproj" />
+  </Folder>
+  <Folder Name="/tools/">
+    <Project Path="tools/WakeWordModelExtractor/WakeWordModelExtractor.csproj" />
+  </Folder>
+</Solution>

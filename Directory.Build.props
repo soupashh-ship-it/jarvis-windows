@@ -1,0 +1,19 @@
+<Project>
+  <PropertyGroup>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
+    <InvariantGlobalization>false</InvariantGlobalization>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <!-- Windows-only desktop app: platform-availability analyzers are noise here. -->
+    <NoWarn>$(NoWarn);CA1416;CA1848;CA2007;CS1591</NoWarn>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <Product>JARVIS for Windows</Product>
+    <Company>JARVIS</Company>
+    <Version Condition="'$(Version)' == ''">1.0.1</Version>
+    <FileVersion Condition="'$(FileVersion)' == ''">$(Version)</FileVersion>
+    <Copyright>MIT licensed</Copyright>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+  </PropertyGroup>
+</Project>
