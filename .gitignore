@@ -38,6 +38,15 @@ secrets.json
 *.cer
 
 # Local reports and captures
-docs/release-readiness-*/
+docs/
 screenshots/
 captures/
+
+*.exe
+*.dll
+*.pdb
+*.onnx
+*.nupkg
+*.snupkg
+*.zip
+
