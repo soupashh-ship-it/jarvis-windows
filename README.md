@@ -12,11 +12,11 @@ Windows may show a SmartScreen warning because this release is not signed with a
 
 JARVIS starts in local mode. Open **Settings** to choose a model provider. You can use a Gemini API key, a local Ollama or LM Studio endpoint, another supported provider, or Google Antigravity CLI sign-in.
 
-To use Google login, install and sign in to the Antigravity CLI first, then select **Google Antigravity (Google login)** in JARVIS settings. Google currently says that using Antigravity through third-party applications is unsupported and may lead to account suspension. Review [Google's Antigravity FAQ](https://antigravity.google/docs/faq) before enabling this provider.
+To use Google login, install and sign in to the Antigravity CLI first, then select **Google Antigravity (Google login)** in JARVIS settings. Google says third-party applications that access Antigravity violate its terms and may lead to account suspension or termination. Review [Google's Antigravity FAQ](https://antigravity.google/docs/faq) before enabling this provider.
 
 ## Requirements
 
-- Windows 10 21H2 or Windows 11, 64-bit.
+- Windows 10 21H2+ or Windows 11, 64-bit. Local speech recognition requires Windows 11 or Windows Server 2022+ and the [Microsoft Visual C++ 2022 x64 Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170).
 - A microphone for voice input. Enable microphone access for desktop apps in Windows privacy settings.
 - Internet access for cloud models and the first local speech-model download.
 
@@ -38,4 +38,5 @@ Wake-word detection and speech transcription run locally. When a cloud provider 
 ## License
 
 MIT. See LICENSE.
+
 
